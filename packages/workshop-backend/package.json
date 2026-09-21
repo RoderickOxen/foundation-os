@@ -24,13 +24,13 @@
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:",
     "diff": "^8.0.4",
-    "jose": "^6.2.8",
+    "jose": "^6.2.12",
     "yjs": "^13.6.31",
-    "zod": "^4.4.3"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "catalog:",
-    "dompurify": "^3.4.13",
+    "dompurify": "^3.4.15",
     "esbuild": "^0.28.1",
     "typescript": "catalog:",
     "vitest": "catalog:",

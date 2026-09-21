@@ -3887,6 +3887,23 @@ type GoogleDriveFolderAction =
    * subfolders to create under the resolved leaf.
    */
   | { type: "scaffoldFolders"; parentPath: string[]; folderNames: string[] }
+  /**
+   * trashFile: soft-delete a file by setting trashed=true. Never a permanent delete.
+   * fileName and fileMimeType are fetched at submit time for the approval description.
+   */
+  | { type: "trashFile"; fileId: string; fileName: string; fileMimeType: string }
+  /**
+   * moveFileToPath: move a file into a folder resolved (and created if needed) from a
+   * relative path under the bound folder. fileName and fileMimeType are fetched at submit
+   * time. targetPath segments are resolved/created sequentially at apply time.
+   */
+  | {
+      type: "moveFileToPath";
+      fileId: string;
+      fileName: string;
+      fileMimeType: string;
+      targetPath: string[];
+    }
   // Legacy action type kept for backward-compatible applyAction on existing DOs.
   | { type: "setupWorkspace"; options: DriveWorkspaceSetupOptions };
 
@@ -3906,6 +3923,37 @@ function validateDriveSegment(segment: string, context: string): void {
     throw new Error(
       `${context}: folder name must not contain slash, backslash, or control characters.`,
     );
+  }
+}
+
+/** Return a short human-readable label for a Drive MIME type. */
+function mimeTypeLabel(mimeType: string): string {
+  switch (mimeType) {
+    case "application/vnd.google-apps.folder":       return "folder";
+    case "application/vnd.google-apps.document":     return "Google Doc";
+    case "application/vnd.google-apps.spreadsheet":  return "Google Sheet";
+    case "application/vnd.google-apps.presentation": return "Google Slides";
+    case "application/vnd.google-apps.form":         return "Google Form";
+    default:                                          return "file";
+  }
+}
+
+/**
+ * Validate a raw Drive file ID supplied by agent code.
+ * Rules: non-empty, ≤ 255 chars, no whitespace or control chars, not the reserved alias "root".
+ */
+function validateDriveFileId(fileId: string, context: string): void {
+  if (typeof fileId !== "string" || fileId.length === 0) {
+    throw new Error(`${context}: fileId must be a non-empty string.`);
+  }
+  if (fileId === "root") {
+    throw new Error(`${context}: "root" is not a valid file ID for this operation.`);
+  }
+  if (fileId.length > 255) {
+    throw new Error(`${context}: fileId must not exceed 255 characters.`);
+  }
+  if (/[\x00-\x1F\s]/.test(fileId)) {
+    throw new Error(`${context}: fileId must not contain whitespace or control characters.`);
   }
 }
 
@@ -4073,6 +4121,32 @@ export class GoogleDriveSetupGatekeeperImpl
         }
         break;
       }
+      case "trashFile": {
+        // Soft-delete: sets trashed=true. The file lands in Google Drive Trash and can
+        // be restored from there. Not a permanent deletion.
+        await api.trashFile(action.fileId);
+        break;
+      }
+      case "moveFileToPath": {
+        // Resolve (creating if needed) the targetPath segments from the bound folder,
+        // then move the file into the resulting leaf folder.
+        // "root" is used as the starting point for My Drive-bound sessions.
+        let moveTargetId: string = folderId;
+        for (let segment of action.targetPath) {
+          const parentId = moveTargetId === "root" ? undefined : moveTargetId;
+          let result = await api.findOrCreateFolder(segment, parentId);
+          moveTargetId = result.file.id;
+        }
+        // Fetch current parents so the file is removed from them during the move.
+        let fileMeta = await api.getFileMeta(action.fileId);
+        await api.moveFile(
+          action.fileId,
+          moveTargetId,
+          // Filter out the target so we don't needlessly remove+add the same parent.
+          (fileMeta.parents ?? []).filter(p => p !== moveTargetId),
+        );
+        break;
+      }
       case "setupWorkspace": {
         // Legacy action from before this gatekeeper became generic.
         // Kept for backward-compatible apply of pending "setupWorkspace" actions still queued
@@ -4160,7 +4234,8 @@ export class GoogleDriveSetupGatekeeperImpl
 
 // Internal TypeScript session type (the .txt file carries the agent-visible version with JSDoc).
 // Both must stay in sync.
-// Nested path methods added: scaffoldFolders, createDocAtPath, createSheetAtPath.
+// Nested path methods: scaffoldFolders, createDocAtPath, createSheetAtPath.
+// Lifecycle methods: listFilesAtPath, trashFile, moveFileToPath.
 interface GoogleDriveFolderSession {
   listFiles(): Promise<import("./drive-setup-api").DriveFileEntry[]>;
   getFolder(): Promise<import("./drive-setup-api").DriveFolderInfo>;
@@ -4173,6 +4248,15 @@ interface GoogleDriveFolderSession {
   createDocAtPath(parentPath: string | string[], name: string, initialText?: string): Promise<void>;
   /** Create a Google Sheet under a relative path inside the bound folder. See drive-setup-types.txt. */
   createSheetAtPath(parentPath: string | string[], name: string, initialRows?: string[][]): Promise<void>;
+  /** List files inside a nested path under the bound folder (observation). See drive-setup-types.txt. */
+  listFilesAtPath(
+    parentPath: string | string[],
+    options?: { name?: string; mimeType?: string; includeTrashed?: boolean; pageSize?: number },
+  ): Promise<import("./drive-setup-api").DriveFileEntry[]>;
+  /** Soft-delete a file (sets trashed=true, NOT permanent). Requires approval. See drive-setup-types.txt. */
+  trashFile(fileId: string): Promise<void>;
+  /** Move a file into a folder resolved from a relative path under the bound folder. Requires approval. */
+  moveFileToPath(fileId: string, targetPath: string | string[]): Promise<void>;
 }
 
 @validateRpc()
@@ -4456,6 +4540,179 @@ class GoogleDriveFolderSessionImpl extends RpcTarget implements GoogleDriveFolde
               "if they do not already exist.\n\n"
             : "") +
           "Existing folders with matching names are reused (idempotent).",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  // ── Lifecycle: listFilesAtPath / trashFile / moveFileToPath ───────────────
+
+  /**
+   * List files inside a nested folder path under the bound folder.
+   * Resolves the path read-only (does NOT create folders). Returns an empty array
+   * with an observation note if the path does not exist.
+   * No approval required — this is a read observation.
+   */
+  async listFilesAtPath(
+    parentPath: string | string[],
+    options?: {
+      name?: string;
+      mimeType?: string;
+      includeTrashed?: boolean;
+      pageSize?: number;
+    },
+  ): Promise<import("./drive-setup-api").DriveFileEntry[]> {
+    let pathSegments = this.#resolvePathSegments(parentPath, "listFilesAtPath");
+
+    let pageSize = options?.pageSize ?? 200;
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 1000) {
+      throw new Error("listFilesAtPath: pageSize must be an integer between 1 and 1000.");
+    }
+
+    let api = new DriveSetupApi(opts => this.#getAccessToken(opts));
+
+    // Read-only path resolution: does not create any folders.
+    let resolvedId = await api.findFolderByPath(pathSegments, this.#folderId);
+
+    let pathLabel = pathSegments.length > 0
+      ? pathSegments.join(" → ")
+      : (this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`);
+
+    if (resolvedId === null) {
+      // Path does not exist inside the bound folder — return empty and record the attempt.
+      await this.#approvalQueue.authorizeObservation({
+        title: `List files at path: ${pathLabel}`,
+        description:
+          `Path **${pathLabel}** was not found inside the bound folder. ` +
+          "Returning empty list. Use scaffoldFolders() to create the path first.",
+      });
+      return [];
+    }
+
+    let files = await api.listFilesInFolder(resolvedId, {
+      name: options?.name,
+      mimeType: options?.mimeType,
+      includeTrashed: options?.includeTrashed,
+      pageSize,
+    });
+
+    let filterParts: string[] = [];
+    if (options?.name)          filterParts.push(`name="${options.name}"`);
+    if (options?.mimeType)      filterParts.push(`type="${options.mimeType}"`);
+    if (options?.includeTrashed) filterParts.push("including trashed");
+    let filterDesc = filterParts.length > 0 ? ` (filters: ${filterParts.join(", ")})` : "";
+
+    await this.#approvalQueue.authorizeObservation({
+      title: `List files at ${pathLabel}`,
+      description: `Listed ${files.length} file(s) in **${pathLabel}**${filterDesc}.`,
+    });
+
+    return files;
+  }
+
+  /**
+   * Soft-delete a file by setting its trashed flag — the file moves to Google Drive Trash
+   * and can be restored from there. This is NOT a permanent deletion.
+   *
+   * RECOMMENDED WORKFLOW:
+   *   1. Call listFiles() or listFilesAtPath() to find the file and confirm its name.
+   *   2. Call trashFile(file.id) to queue the trash action for approval.
+   *   3. User approves in the Workshop UI.
+   *   4. Call listFiles() again to confirm the file is gone from the listing.
+   *
+   * Requires user approval before executing.
+   */
+  async trashFile(fileId: string): Promise<void> {
+    validateDriveFileId(fileId, "trashFile");
+
+    let api = new DriveSetupApi(opts => this.#getAccessToken(opts));
+
+    // Fetch metadata to populate the approval description and verify the file exists.
+    let meta = await api.getFileMeta(fileId);
+    if (meta.trashed) {
+      throw new Error(
+        `trashFile: "${meta.name}" (${fileId}) is already in the trash. ` +
+        "No action taken.",
+      );
+    }
+
+    let typeLabel = mimeTypeLabel(meta.mimeType);
+    let action: GoogleDriveFolderAction = {
+      type: "trashFile",
+      fileId,
+      fileName: meta.name,
+      fileMimeType: meta.mimeType,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Trash ${typeLabel}: ${meta.name}`),
+        description:
+          `Move **${meta.name}** (${typeLabel}) to the Google Drive Trash.\n\n` +
+          formatApprovalField("File ID", fileId) +
+          "\n\n**This is a soft delete.** The file is NOT permanently removed. " +
+          "It can be restored from the Drive Trash at any time.\n\n" +
+          "Recommended: call listFiles() or listFilesAtPath() to confirm the correct " +
+          "file before approving.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Move a file into a target folder resolved from a relative path under the bound folder.
+   * Intermediate folders in `targetPath` are created idempotently if absent (same as
+   * scaffoldFolders). The file is removed from its current parent(s) and placed in the
+   * resolved target.
+   *
+   * @param fileId      Drive file ID to move. Obtain from listFiles() or listFilesAtPath().
+   * @param targetPath  Relative path under the bound folder. Same string | string[] convention
+   *                    as other path-aware methods. Pass [] or "" to move into the bound folder.
+   *
+   * Requires user approval before executing.
+   */
+  async moveFileToPath(fileId: string, targetPath: string | string[]): Promise<void> {
+    validateDriveFileId(fileId, "moveFileToPath");
+    let pathSegments = this.#resolvePathSegments(targetPath, "moveFileToPath");
+
+    let api = new DriveSetupApi(opts => this.#getAccessToken(opts));
+
+    // Fetch metadata to populate the approval description and verify the file exists.
+    let meta = await api.getFileMeta(fileId);
+    let typeLabel = mimeTypeLabel(meta.mimeType);
+
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    let pathLabel = pathSegments.length > 0
+      ? `**${pathSegments.join(" → ")}** (inside ${folderLabel})`
+      : folderLabel;
+
+    let action: GoogleDriveFolderAction = {
+      type: "moveFileToPath",
+      fileId,
+      fileName: meta.name,
+      fileMimeType: meta.mimeType,
+      targetPath: pathSegments,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Move ${typeLabel}: ${meta.name}`),
+        description:
+          `Move **${meta.name}** (${typeLabel}) into ${pathLabel}.\n\n` +
+          formatApprovalField("File ID", fileId) +
+          "\n\nThe file is removed from its current location and placed in the target folder." +
+          (pathSegments.length > 0
+            ? `\n\nIntermediate folder(s) (**${pathSegments.join(" → ")}**) will be created ` +
+              "if they do not already exist."
+            : ""),
         implementsRevert: false,
       });
     } catch (error) {

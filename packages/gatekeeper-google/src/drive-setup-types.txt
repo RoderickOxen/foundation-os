@@ -32,25 +32,33 @@ export type DriveFolderInfo = {
  *   all scoped to the bound folder. Raw Drive IDs are never accepted from agent code.
  *
  * IMPORTANT CONSTRAINTS:
- *   ✓ listFiles() and getFolder() are read-only observations (no approval needed).
+ *   ✓ listFiles(), listFilesAtPath(), and getFolder() are read-only observations
+ *     (no approval needed).
  *   ✓ createFolder(), createDoc(), createSheet(), scaffoldFolders(),
- *     createDocAtPath(), and createSheetAtPath() require user approval before executing.
+ *     createDocAtPath(), createSheetAtPath(), trashFile(), and moveFileToPath()
+ *     require user approval before executing.
  *   ✓ All create/scaffold operations are idempotent: existing items with the same name
  *     are reused rather than duplicated. Safe to re-run on repeat calls.
  *   ✓ scaffoldFolders() creates nested subfolders under a relative path inside the bound
  *     folder — no new Drive binding is needed for each student/aluno.
  *   ✓ createDocAtPath() and createSheetAtPath() create a Doc or Sheet inside a nested
  *     subfolder path, also without requiring a new Drive binding per aluno.
- *   ✗ Does NOT delete or move existing files.
+ *   ✓ listFilesAtPath() lists files inside a nested path under the bound folder without
+ *     requiring a separate binding per subfolder.
+ *   ✓ trashFile() is a SOFT DELETE — file moves to Drive Trash, NOT permanently deleted.
+ *     Always call listFiles()/listFilesAtPath() first to confirm the correct fileId.
+ *   ✓ moveFileToPath() moves a file into a relative path under the bound folder.
+ *     Intermediate folders are created if needed.
+ *   ✗ Does NOT permanently delete files (use the Drive Trash UI for that).
  *   ✗ Does NOT send email (use the Gmail binding for that).
- *   ✗ Does NOT expose raw Drive file/folder IDs for creation; use relative names/paths.
+ *   ✗ Does NOT expose raw Drive folder IDs for creation/scaffolding; use relative names/paths.
  *   ✗ Does NOT support file uploads, sharing/permissions changes, Drive-wide search,
  *     file export, or batch file operations — those remain outside this session's scope.
  *
  * WORKFLOW for creating items:
  *   1. Call any create/scaffold method to queue the creation for approval.
  *   2. User approves the action in the Workshop UI.
- *   3. Call listFiles() (on the target folder if needed) to verify the new items.
+ *   3. Call listFiles() or listFilesAtPath() to verify the new items.
  *
  * NESTED FOLDER SCAFFOLDING (scaffoldFolders):
  *   One "Alunos" Drive binding can scaffold per-student subfolders without a new binding
@@ -239,4 +247,98 @@ export interface GoogleDriveFolderSession {
     name: string,
     initialRows?: string[][],
   ): Promise<void>;
+
+  /**
+   * List files and folders inside a nested path under the bound folder.
+   * No approval required — this is a read-only observation.
+   * Path segments are resolved read-only (folders are NOT created if absent).
+   * Returns an empty array if the path does not exist.
+   *
+   * @param parentPath  A single folder name (string) or ordered list of names (string[])
+   *                    forming a relative path under the bound folder. Pass [] or "" to
+   *                    list the bound folder itself (equivalent to listFiles()).
+   * @param options.name          Optional exact-name filter.
+   * @param options.mimeType      Optional MIME type filter. Common values:
+   *                                "application/vnd.google-apps.folder"
+   *                                "application/vnd.google-apps.document"
+   *                                "application/vnd.google-apps.spreadsheet"
+   * @param options.includeTrashed  Include trashed items (default false).
+   * @param options.pageSize        Max results, 1–1000 (default 200).
+   *
+   * Examples:
+   *   // List files directly inside "Ana Silva" (under bound folder)
+   *   const files = await drive.listFilesAtPath("Ana Silva");
+   *
+   *   // List only Google Docs inside a nested path
+   *   const docs = await drive.listFilesAtPath(
+   *     ["Ana Silva", "Relatorios Semanais"],
+   *     { mimeType: "application/vnd.google-apps.document" },
+   *   );
+   *
+   *   // List up to 50 items including trashed ones
+   *   const all = await drive.listFilesAtPath("Arquivados", { includeTrashed: true, pageSize: 50 });
+   */
+  listFilesAtPath(
+    parentPath: string | string[],
+    options?: {
+      name?: string;
+      mimeType?: string;
+      includeTrashed?: boolean;
+      pageSize?: number;
+    },
+  ): Promise<DriveFileEntry[]>;
+
+  /**
+   * Submit a request to soft-delete a file by moving it to Google Drive Trash.
+   * This is NOT a permanent deletion — the file can be restored from the Trash at any time.
+   * Requires user approval before executing.
+   *
+   * IMPORTANT: The `fileId` must come from a previous listFiles() or listFilesAtPath()
+   * call to ensure you are trashing the intended file. Confirm the file name in the
+   * approval dialog before approving.
+   *
+   * @param fileId  Drive file ID returned by listFiles() or listFilesAtPath().
+   *                Must be a non-empty string, ≤ 255 characters, no whitespace.
+   *
+   * Throws if:
+   *   - The file does not exist or is not accessible.
+   *   - The file is already in the trash.
+   *
+   * Examples:
+   *   // Find a file, then trash it
+   *   const files = await drive.listFilesAtPath("Ana Silva");
+   *   const report = files.find(f => f.name === "Relatorio Antigo");
+   *   if (report) await drive.trashFile(report.id);
+   */
+  trashFile(fileId: string): Promise<void>;
+
+  /**
+   * Submit a request to move a file into a target folder resolved from a relative path
+   * under the bound folder. All path resolution starts from the bound folder — raw Drive
+   * IDs are never used for the target.
+   * Intermediate folders in `targetPath` are created idempotently if absent (same as
+   * scaffoldFolders). The file is removed from its current parent(s).
+   * Requires user approval before executing.
+   *
+   * @param fileId      Drive file ID to move. Obtain from listFiles() or listFilesAtPath().
+   * @param targetPath  Relative path under the bound folder to move the file into.
+   *                    A single folder name (string) or ordered list of names (string[]).
+   *                    Pass [] or "" to move into the bound folder itself.
+   *
+   * Segment rules (applied to every path segment):
+   *   - Must be non-empty and at most 255 characters.
+   *   - Must not contain `/`, `\`, null bytes, or control characters (ASCII 0–31).
+   *   - At most 10 path segments.
+   *
+   * Examples:
+   *   // Move a file into "Ana Silva / Arquivados" (creates Arquivados if needed)
+   *   await drive.moveFileToPath(file.id, ["Ana Silva", "Arquivados"]);
+   *
+   *   // Move a file into a single subfolder directly inside the bound folder
+   *   await drive.moveFileToPath(file.id, "Relatorios");
+   *
+   *   // Move a file into the bound folder itself
+   *   await drive.moveFileToPath(file.id, []);
+   */
+  moveFileToPath(fileId: string, targetPath: string | string[]): Promise<void>;
 }

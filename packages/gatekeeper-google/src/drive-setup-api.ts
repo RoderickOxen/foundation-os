@@ -18,9 +18,26 @@ const FOLDER_MIME = "application/vnd.google-apps.folder";
 const DOC_MIME = "application/vnd.google-apps.document";
 const SHEET_MIME = "application/vnd.google-apps.spreadsheet";
 
+const MAX_LIST_PAGE_SIZE = 1000;
+const DEFAULT_LIST_PAGE_SIZE = 200;
+
 export type DriveFileRef = {
   id: string;
   name: string;
+};
+
+/**
+ * Metadata returned by getFileMeta(). Includes trashed status and immediate parents,
+ * used to populate approval descriptions and to determine old parents when moving a file.
+ */
+export type DriveFileMeta = {
+  id: string;
+  name: string;
+  mimeType: string;
+  /** Whether the file is currently in the trash. */
+  trashed: boolean;
+  /** Immediate parent folder IDs. Typically one entry; Drive supports multi-parent as a legacy feature. */
+  parents?: string[];
 };
 
 /** A file or folder entry returned by listFiles(). */
@@ -89,6 +106,66 @@ export class DriveSetupApi {
   }
 
   /**
+   * List files and folders directly inside `folderId` with optional filters.
+   * Pass `"root"` for My Drive root. Applies the `drive` scope to see all files.
+   *
+   * @param folderId        Folder to list — `"root"` or a real Drive folder ID.
+   * @param opts.name       Optional exact-name filter.
+   * @param opts.mimeType   Optional MIME type filter.
+   * @param opts.includeTrashed  Include trashed files (default false).
+   * @param opts.pageSize   Max results, 1–1000 (default 200).
+   */
+  async listFilesInFolder(
+    folderId: string,
+    opts: {
+      name?: string;
+      mimeType?: string;
+      includeTrashed?: boolean;
+      pageSize?: number;
+    } = {},
+  ): Promise<DriveFileEntry[]> {
+    const { name, mimeType, includeTrashed = false, pageSize = DEFAULT_LIST_PAGE_SIZE } = opts;
+    const clampedPageSize = Math.min(MAX_LIST_PAGE_SIZE, Math.max(1, pageSize));
+
+    // Drive query: single-quote literal values and escape embedded quotes/backslashes.
+    let q = `'${folderId}' in parents`;
+    if (!includeTrashed) q += " and trashed = false";
+    if (name !== undefined) {
+      const escaped = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      q += ` and name = '${escaped}'`;
+    }
+    if (mimeType !== undefined) {
+      q += ` and mimeType = '${mimeType}'`;
+    }
+
+    const url = new URL(`${DRIVE_API_BASE}/files`);
+    url.searchParams.set("q", q);
+    url.searchParams.set("fields", "files(id,name,mimeType,webViewLink,modifiedTime,size)");
+    url.searchParams.set("pageSize", String(clampedPageSize));
+    url.searchParams.set("orderBy", "folder,name");
+
+    const response = await fetchWithAuthRetry(url.toString(), {}, this.getToken);
+    if (!response.ok) {
+      const text = await readErrorText(response);
+      throw new Error(`Drive file list failed: ${response.status} ${text}`);
+    }
+    const body = await response.json<{
+      files?: Array<{
+        id: string; name: string; mimeType: string;
+        webViewLink?: string; modifiedTime?: string; size?: string;
+      }>;
+    }>();
+    return (body.files ?? []).map(f => ({
+      id: f.id,
+      name: f.name,
+      mimeType: f.mimeType,
+      ...(f.webViewLink ? { url: f.webViewLink } : {}),
+      ...(f.modifiedTime ? { modifiedTime: f.modifiedTime } : {}),
+      ...(f.size ? { size: f.size } : {}),
+    }));
+  }
+
+  /**
    * Get the name and URL of a Drive folder by its ID.
    * Pass `"root"` to get My Drive metadata.
    * Requires the `drive` scope.
@@ -115,6 +192,29 @@ export class DriveSetupApi {
   }
 
   // ── Discovery ────────────────────────────────────────────────────────────
+
+  /**
+   * Resolve a sequence of folder-name segments to a folder ID, starting from `rootId`.
+   * Uses `findByName` at each step — **read-only**, never creates folders.
+   * Returns the resolved folder ID string, or `null` if any segment along the path
+   * does not exist.
+   *
+   * Pass `"root"` for `rootId` to start from My Drive root; pass a real folder ID to
+   * start from a specific bound folder. An empty `segments` array returns `rootId`
+   * immediately (the starting folder itself).
+   */
+  async findFolderByPath(
+    segments: string[],
+    rootId: string,
+  ): Promise<string | null> {
+    let currentId: string = rootId;
+    for (const segment of segments) {
+      const found = await this.findByName(segment, currentId, FOLDER_MIME);
+      if (!found) return null;
+      currentId = found.id;
+    }
+    return currentId;
+  }
 
   /**
    * Find a file by name within an optional parent and of an optional MIME type.
@@ -293,5 +393,90 @@ export class DriveSetupApi {
     }
 
     return { file, created: true };
+  }
+
+  // ── File metadata ─────────────────────────────────────────────────────────
+
+  /**
+   * Fetch basic metadata for a file or folder by its Drive ID.
+   * Returns id, name, mimeType, trashed flag, and immediate parent IDs.
+   * Throws on 404 (not found) or 403 (permission denied).
+   */
+  async getFileMeta(fileId: string): Promise<DriveFileMeta> {
+    const response = await fetchWithAuthRetry(
+      `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,trashed,parents`,
+      {},
+      this.getToken,
+    );
+    if (!response.ok) {
+      const text = await readErrorText(response);
+      throw new Error(`Drive file metadata fetch failed [http=${response.status}]: ${text}`);
+    }
+    return response.json<DriveFileMeta>();
+  }
+
+  // ── File lifecycle ────────────────────────────────────────────────────────
+
+  /**
+   * Soft-delete a file by setting `trashed = true` via a PATCH request.
+   * The file is moved to Google Drive Trash and can be restored from there.
+   * This is NOT a permanent deletion. Requires the `drive` scope.
+   */
+  async trashFile(fileId: string): Promise<void> {
+    const response = await fetchWithAuthRetry(
+      `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trashed: true }),
+      },
+      this.getToken,
+    );
+    if (!response.ok) {
+      const text = await readErrorText(response);
+      throw new Error(`Failed to trash Drive file [http=${response.status}]: ${text}`);
+    }
+    await response.body?.cancel();
+  }
+
+  /**
+   * Move a file to a new parent folder, removing its current parent(s).
+   *
+   * @param fileId          The file to move.
+   * @param addParentId     The target folder ID to add as a parent (`"root"` for My Drive root).
+   * @param removeParentIds Current parent IDs to remove. Pass an empty array to keep the old
+   *                        parents and add the new one in addition (rare; prefer always passing
+   *                        the current parents from a preceding `getFileMeta` call).
+   *
+   * Requires the `drive` scope.
+   */
+  async moveFile(
+    fileId: string,
+    addParentId: string,
+    removeParentIds: string[],
+  ): Promise<void> {
+    const url = new URL(`${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}`);
+    url.searchParams.set("addParents", addParentId);
+    // Only set removeParents when there is something to remove; omitting it is a no-op.
+    const toRemove = removeParentIds.filter(id => id !== addParentId);
+    if (toRemove.length > 0) {
+      url.searchParams.set("removeParents", toRemove.join(","));
+    }
+    url.searchParams.set("fields", "id");
+
+    const response = await fetchWithAuthRetry(
+      url.toString(),
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      },
+      this.getToken,
+    );
+    if (!response.ok) {
+      const text = await readErrorText(response);
+      throw new Error(`Failed to move Drive file [http=${response.status}]: ${text}`);
+    }
+    await response.body?.cancel();
   }
 }

@@ -1,0 +1,139 @@
+// Types for the Google Drive Folder gatekeeper.
+// Exposed to the AI agent as part of the Google gatekeeper's TypeScript type catalog.
+
+/** A file or folder entry returned by listFiles(). */
+export type DriveFileEntry = {
+  id: string;
+  name: string;
+  /** MIME type — e.g. "application/vnd.google-apps.folder", "application/vnd.google-apps.document",
+   *  "application/vnd.google-apps.spreadsheet". */
+  mimeType: string;
+  /** Web URL to open the file in a browser (present for Google Workspace files). */
+  url?: string;
+  modifiedTime?: string;
+  /** File size in bytes as a string. Absent for Google Workspace files (Docs, Sheets, etc.). */
+  size?: string;
+};
+
+/** Metadata for a Google Drive folder. */
+export type DriveFolderInfo = {
+  id: string;
+  name: string;
+  /** Web URL to open the folder in Google Drive. */
+  url: string;
+};
+
+/**
+ * Session for the Google Drive Folder connection.
+ *
+ * PURPOSE:
+ *   Query the contents of a connected Google Drive folder and create new subfolders,
+ *   Google Docs, and Google Sheets inside it. All folder operations are scoped to the
+ *   bound folder — raw Drive IDs are never accepted from agent code.
+ *
+ * IMPORTANT CONSTRAINTS:
+ *   ✓ listFiles() and getFolder() are read-only observations (no approval needed).
+ *   ✓ createFolder(), createDoc(), createSheet(), and scaffoldFolders() require user
+ *     approval before executing.
+ *   ✓ All create/scaffold operations are idempotent: existing items with the same name
+ *     are reused rather than duplicated. Safe to re-run on repeat calls.
+ *   ✓ scaffoldFolders() creates nested subfolders under a relative path inside the bound
+ *     folder — no new Drive binding is needed for each student/aluno.
+ *   ✗ Does NOT delete or move existing files.
+ *   ✗ Does NOT send email (use the Gmail binding for that).
+ *   ✗ Does NOT expose raw Drive file/folder IDs for folder creation; use relative names.
+ *   ✗ Does NOT support file uploads, sharing/permissions changes, search across Drive,
+ *     export, or batch file operations — those remain outside this session's scope.
+ *
+ * WORKFLOW for creating items:
+ *   1. Call createFolder() / createDoc() / createSheet() / scaffoldFolders() to queue
+ *      the creation for approval.
+ *   2. User approves the action in the Workshop UI.
+ *   3. Call listFiles() to see the newly created items.
+ *
+ * NESTED FOLDER SCAFFOLDING (scaffoldFolders):
+ *   One "Alunos" Drive binding can create per-student folders without needing a new
+ *   binding per student. Example — create Documentos, Fotos, Relatorios Semanais
+ *   inside each aluno's folder:
+ *
+ *     await drive.scaffoldFolders("Ana Silva", ["Documentos", "Fotos", "Relatorios Semanais"]);
+ *     await drive.scaffoldFolders("Bruno Costa", ["Documentos", "Fotos", "Relatorios Semanais"]);
+ *
+ *   Or with a deeper path (creates intermediate folders automatically):
+ *
+ *     await drive.scaffoldFolders(["Turma A", "Ana Silva"], ["Documentos", "Fotos"]);
+ *
+ * CONNECTING A SPECIFIC FOLDER:
+ *   Connect with a folder URL such as https://drive.google.com/drive/folders/<folderId>.
+ *   Use folderId "root" or the My Drive URL to access the root of your Drive.
+ */
+export interface GoogleDriveFolderSession {
+  /**
+   * List all non-trashed files and folders directly inside the connected folder.
+   * Returns an observation (no approval required).
+   * Use this to answer "what is in my folder?" or to discover file IDs for further actions.
+   */
+  listFiles(): Promise<DriveFileEntry[]>;
+
+  /**
+   * Get name and URL metadata for the connected folder itself.
+   * Returns an observation (no approval required).
+   */
+  getFolder(): Promise<DriveFolderInfo>;
+
+  /**
+   * Submit a request to create a subfolder directly inside the connected folder.
+   * If a folder with the same name already exists, it will be reused after approval.
+   * The action requires user approval before it is executed.
+   * Call listFiles() after approval to see the new folder.
+   */
+  createFolder(name: string): Promise<void>;
+
+  /**
+   * Submit a request to create a Google Doc inside the connected folder.
+   * Optionally inserts `initialText` as the document's starting content.
+   * If a Doc with the same name already exists, it will be reused after approval.
+   * The action requires user approval before it is executed.
+   * Call listFiles() after approval to see the new document.
+   */
+  createDoc(name: string, initialText?: string): Promise<void>;
+
+  /**
+   * Submit a request to create a Google Sheet inside the connected folder.
+   * Optionally appends `initialRows` as the spreadsheet's starting data.
+   * If a Sheet with the same name already exists, it will be reused after approval.
+   * The action requires user approval before it is executed.
+   * Call listFiles() after approval to see the new spreadsheet.
+   */
+  createSheet(name: string, initialRows?: string[][]): Promise<void>;
+
+  /**
+   * Submit a request to create one or more subfolders under a relative path inside the
+   * bound folder. All path resolution starts from the bound folder — no raw Drive IDs.
+   *
+   * @param parentPath  A single folder name (string) or an ordered list of names (string[])
+   *                    forming a relative path under the bound folder. Each intermediate
+   *                    folder is created if it does not exist. Pass [] or "" to create
+   *                    directly inside the bound folder.
+   * @param folderNames Names of the subfolders to create under the resolved parentPath.
+   *
+   * Segment rules (applied to every path segment and folder name):
+   *   - Must be non-empty and at most 255 characters.
+   *   - Must not contain `/`, `\`, null bytes, or control characters (ASCII 0–31).
+   *   - At most 10 path segments, at most 50 folder names per call.
+   *
+   * Idempotent: existing folders with matching names are reused, not duplicated.
+   * Requires user approval before any folders are created.
+   *
+   * Examples:
+   *   // Create Documentos, Fotos, Relatorios Semanais inside "Ana Silva" (under bound folder)
+   *   await drive.scaffoldFolders("Ana Silva", ["Documentos", "Fotos", "Relatorios Semanais"]);
+   *
+   *   // Create the same under Turma A / Ana Silva (two-level path, created if needed)
+   *   await drive.scaffoldFolders(["Turma A", "Ana Silva"], ["Documentos", "Fotos"]);
+   *
+   *   // Create directly inside the bound folder
+   *   await drive.scaffoldFolders([], ["Documentos", "Fotos"]);
+   */
+  scaffoldFolders(parentPath: string | string[], folderNames: string[]): Promise<void>;
+}

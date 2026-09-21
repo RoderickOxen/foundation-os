@@ -8,8 +8,8 @@ This package provides Google OAuth integration for Gadgets. It serves two purpos
   which becomes the user's identity.
   The sign-in grant is transient (discarded right after the email is read).
 - **Connections:** when a user connects Google (or signs in and later connects it), the scopes for
-  the selected resources (Gmail, Docs, Sheets, Calendar, or BigQuery — see below) are requested so
-  gadgets can access those APIs on the user's behalf.
+  the selected resources (Gmail, Docs, Sheets, Calendar, BigQuery, or Google Drive Folder) are
+  requested so gadgets can access those APIs on the user's behalf.
 
 A single Google OAuth client is used for both. Set it up as follows.
 
@@ -51,7 +51,7 @@ You'll need to enable the Google APIs that you want to use. Currently supported:
 18. Click on **BigQuery API** in the results
 19. Click **Enable**
 
-The Google Drive API is used only to search and display document and spreadsheet metadata in the resource pickers. Document reads and edits still go through the Google Docs API, and spreadsheet reads go through the Google Sheets API.
+The Google Drive API is used both to search and display document and spreadsheet metadata in the resource pickers, and by the **Google Drive Folder** connection type which lets the agent list and manage files inside a connected Drive folder.
 
 ### Step 3: Configure the OAuth Consent Screen
 
@@ -76,10 +76,11 @@ included). Across all resource types, the gatekeeper can request:
 - `gmail.modify` for Gmail thread reads, organization, replies, forwards, and sending. This single scope already includes label access and sending.
 - `documents` for Google Docs reads and edits.
 - `drive.metadata.readonly` so the resource pickers can search Google Docs and Sheets by title.
-- `spreadsheets.readonly` to read metadata and cell values from selected Google spreadsheets.
+- `spreadsheets` to read and write cell values in selected Google spreadsheets.
 - `calendar.calendarlist.readonly` so the resource picker can list calendars.
 - `calendar.events` to manage selected calendar and check calendar availability.
 - `bigquery` for BigQuery dry-runs and queries. This is intentionally broader than `bigquery.readonly` because dry-runs use `jobs.insert`; the gatekeeper enforces read-only SQL and resource scope checks before running queries.
+- `drive` (the full Drive scope) for **Google Drive Folder** connections — required to list and write files in arbitrary Drive folders not created by this app. **Note:** `https://www.googleapis.com/auth/drive` is a [restricted scope](https://developers.google.com/identity/protocols/oauth2/scopes#drive) that requires Google's OAuth verification review before a production public app may use it. For development/testing this works with Test Users listed on the OAuth consent screen.
 
 ### Step 4: Test Users
 
@@ -135,7 +136,7 @@ User — see Step 4.)
 2. Create or open a gadget.
 3. Navigate to the **Connections** tab.
 4. Click **+ New Connection**.
-5. Choose a Google resource type: Gmail, Google Doc, Google Spreadsheet, Google Calendar, or BigQuery.
+5. Choose a Google resource type: Gmail, Google Doc, Google Spreadsheet, Google Calendar, BigQuery, or Google Drive Folder.
 6. If prompted, connect a Google account.
 7. You should be redirected to Google's consent screen in a new tab.
 8. The consent screen acts extra-scary since this is an "unverified" test app.

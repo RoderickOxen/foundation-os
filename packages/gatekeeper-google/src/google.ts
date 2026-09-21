@@ -1,6 +1,13 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
+import {
+  AUTH_SCOPES, BIGQUERY_HOST,
+  GMAIL_RESOURCE, GOOGLE_DOC_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
+  BIGQUERY_RESOURCE, GOOGLE_DRIVE_FOLDER_RESOURCE,
+  LEGACY_GRANTED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES,
+  resourceUrlPatternsToOAuthScopes, grantedResourcesFromScopes,
+} from "./scopes";
 import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GmailApi, GmailMessageRaw, GmailOutboundMessage, GoogleAccessToken, normalizeEmailRecipients, revokeGoogleToken } from "./google-api";
 import {
   GmailSession, GmailThread, GmailMessage,
@@ -10,7 +17,8 @@ import { GoogleDocSession, DocMetadata } from "./docs-types";
 import { GoogleDocsApi } from "./docs-api";
 import { GoogleSheetsApi } from "./sheets-api";
 import type {
-  GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
+  GoogleSpreadsheetSession, SpreadsheetCellValue, SpreadsheetInfo, SpreadsheetRange,
+  SpreadsheetValueMode,
 } from "./sheets-types";
 import { docToMarkdown, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
 import { BigQueryApi, DEFAULT_MAX_BYTES_BILLED } from "./bigquery-api";
@@ -32,16 +40,20 @@ import DOCS_TYPES_CODE from "./docs-types.txt";
 import BIGQUERY_TYPES_CODE from "./bigquery-types.txt";
 import CALENDAR_TYPES_CODE from "./calendar-types.txt";
 import SHEETS_TYPES_CODE from "./sheets-types.txt";
+import DRIVE_SETUP_TYPES_CODE from "./drive-setup-types.txt";
+import { DriveSetupApi } from "./drive-setup-api";
 import {
   BigQueryConfiguratorUI,
   CalendarConfiguratorUI,
   GmailConfiguratorUI,
+  GoogleDriveSetupConfiguratorUI,
   GoogleDocConfiguratorUI,
   GoogleSheetsConfiguratorUI,
 } from "./google-configurators";
 import BIGQUERY_CONFIGURATOR_HTML from "./generated/bigquery-configurator-ui.txt";
 import CALENDAR_CONFIGURATOR_HTML from "./generated/calendar-configurator-ui.txt";
 import GMAIL_CONFIGURATOR_HTML from "./generated/gmail-configurator-ui.txt";
+import GOOGLE_DRIVE_SETUP_CONFIGURATOR_HTML from "./generated/google-drive-setup-configurator-ui.txt";
 import GOOGLE_DOC_CONFIGURATOR_HTML from "./generated/google-doc-configurator-ui.txt";
 import GOOGLE_SHEETS_CONFIGURATOR_HTML from "./generated/google-sheets-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
@@ -210,140 +222,6 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
   </body>
 </html>`;
 
-// OAuth scopes we always request, used to identify the account (name, email, avatar). Not tied to
-// any resource type.
-const IDENTITY_SCOPES = [
-  "openid",
-  "https://www.googleapis.com/auth/userinfo.profile",
-  "https://www.googleapis.com/auth/userinfo.email",
-];
-
-// Minimal scopes for sign-in only (verify the user's email). Used when connecting in "auth" mode;
-// the resulting grant is transient. (Same as IDENTITY_SCOPES — sign-in needs no resource scopes.)
-const AUTH_SCOPES = IDENTITY_SCOPES;
-
-const BIGQUERY_HOST = "bigquery.googleapis.com";
-
-const GMAIL_RESOURCE: SupportedResource = {
-  urlPattern: "https://mail.google.com/*",
-  title: "Gmail Mailbox",
-  description: "Read emails and apply labels.",
-  grantable: true,
-};
-
-const GOOGLE_DOC_RESOURCE: SupportedResource = {
-  urlPattern: "https://docs.google.com/document/d/:docId/*",
-  title: "Google Doc",
-  description:
-      "Read and edit documents you choose.",
-  grantable: true,
-};
-
-const GOOGLE_SHEETS_RESOURCE: SupportedResource = {
-  urlPattern: "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
-  title: "Google Spreadsheet",
-  description: "Read values from a spreadsheet you choose.",
-  grantable: true,
-};
-
-const GOOGLE_CALENDAR_RESOURCE: SupportedResource = {
-  urlPattern: "https://calendar.google.com/calendar/:calendarId/*",
-  title: "Google Calendar",
-  description:
-      "Read and manage a Google Calendar.",
-  grantable: true,
-};
-
-const BIGQUERY_RESOURCE: SupportedResource = {
-  urlPattern: `https://${BIGQUERY_HOST}/:projectId/*`,
-  title: "BigQuery",
-  description: "Choose a Google Cloud project, then optionally narrow access to a dataset or table.",
-  grantable: true,
-};
-
-// Accounts connected before per-resource scope tracking received scopes for exactly these
-// resources.
-const LEGACY_GRANTED_RESOURCE_URL_PATTERNS = [
-  GMAIL_RESOURCE.urlPattern,
-  GOOGLE_DOC_RESOURCE.urlPattern,
-  BIGQUERY_RESOURCE.urlPattern,
-];
-
-const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] = [
-  {
-    resource: GMAIL_RESOURCE,
-    scopes: [
-      "https://www.googleapis.com/auth/gmail.labels",
-      "https://www.googleapis.com/auth/gmail.modify",
-    ],
-  },
-  {
-    resource: GOOGLE_DOC_RESOURCE,
-    scopes: [
-      "https://www.googleapis.com/auth/documents",
-      // Read-only Drive file metadata, used to power the doc picker when connecting a Google Doc.
-      "https://www.googleapis.com/auth/drive.metadata.readonly",
-    ],
-  },
-  {
-    resource: GOOGLE_SHEETS_RESOURCE,
-    scopes: [
-      "https://www.googleapis.com/auth/spreadsheets.readonly",
-      // Read-only Drive file metadata, used to power the spreadsheet picker.
-      "https://www.googleapis.com/auth/drive.metadata.readonly",
-    ],
-  },
-  {
-    resource: GOOGLE_CALENDAR_RESOURCE,
-    scopes: [
-      // Read-only calendar list, used to power the calendar picker when connecting a calendar.
-      "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
-      "https://www.googleapis.com/auth/calendar.events",
-    ],
-  },
-  {
-    resource: BIGQUERY_RESOURCE,
-    scopes: [
-      // `bigquery` (not `bigquery.readonly`): dry-runs go through `jobs.insert` for scope
-      // enforcement, which `readonly` doesn't permit. Read-only is enforced at the API layer.
-      "https://www.googleapis.com/auth/bigquery",
-    ],
-  },
-];
-
-const SUPPORTED_RESOURCES: SupportedResource[] = RESOURCE_SCOPES.map(entry => entry.resource);
-
-function validateResourceUrlPatterns(resourceUrlPatterns?: string[]): void {
-  if (resourceUrlPatterns === undefined) return;
-
-  let knownPatterns = new Set(RESOURCE_SCOPES.map(entry => entry.resource.urlPattern));
-  let unknownPatterns = resourceUrlPatterns.filter(pattern => !knownPatterns.has(pattern));
-  if (unknownPatterns.length > 0) {
-    throw new Error(`Unknown grantable resource URL pattern(s): ${unknownPatterns.join(", ")}`);
-  }
-}
-
-// The OAuth scopes to request for the given grantable resource `urlPattern`s.
-function resourceUrlPatternsToOAuthScopes(resourceUrlPatterns?: string[]): string[] {
-  validateResourceUrlPatterns(resourceUrlPatterns);
-
-  let scopes = new Set<string>(IDENTITY_SCOPES);
-  for (let entry of RESOURCE_SCOPES) {
-    if (resourceUrlPatterns === undefined ||
-        resourceUrlPatterns.includes(entry.resource.urlPattern)) {
-      for (let scope of entry.scopes) scopes.add(scope);
-    }
-  }
-  return [...scopes];
-}
-
-function grantedResourcesFromScopes(grantedOAuthScopes: string[]): string[] {
-  let granted = new Set(grantedOAuthScopes);
-  return RESOURCE_SCOPES
-      .filter(entry => entry.scopes.every(scope => granted.has(scope)))
-      .map(entry => entry.resource.urlPattern);
-}
-
 const GOOGLE_LOGO_URL = `data:image/svg+xml,${encodeURIComponent(GOOGLE_LOGO_SVG)}`;
 
 /** Main HTTP UI entrypoint. We only use this to initiate and complete OAuth requests to Google. */
@@ -479,6 +357,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   async getTypeScriptTypes(): Promise<string> {
     return [
       TYPES_CODE, DOCS_TYPES_CODE, SHEETS_TYPES_CODE, CALENDAR_TYPES_CODE, BIGQUERY_TYPES_CODE,
+      DRIVE_SETUP_TYPES_CODE,
     ].join("\n");
   }
 }
@@ -933,6 +812,33 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       };
     }
 
+    // Google Drive Folder — routes both specific folder URLs (/drive/folders/:id) and the
+    // legacy My Drive root URL (/drive/my-drive). "root" is the Google Drive API's special
+    // folder ID for the authenticated user's My Drive root.
+    if (parsed.hostname === "drive.google.com" &&
+        (parsed.pathname.startsWith("/drive/folders/") ||
+         stripTrailingSlashes(parsed.pathname) === "/drive/my-drive")) {
+      let folderId: string | undefined;
+      if (parsed.pathname.startsWith("/drive/folders/")) {
+        // Extract the folder ID from the path: /drive/folders/<folderId>[/...]
+        const segments = parsed.pathname.split("/").filter(Boolean);
+        // segments = ["drive", "folders", "<folderId>", ...]
+        folderId = segments[2];
+        if (!folderId) {
+          throw new Error("Invalid Google Drive folder URL: missing folder ID after /drive/folders/");
+        }
+      }
+      // folderId = undefined for /drive/my-drive (legacy root URL); treated as "root" by session.
+      let props: GoogleDriveSetupGatekeeperImplProps = {
+        userObjectId: this.ctx.props.userObjectId,
+        folderId,
+      };
+      return {
+        class: this.ctx.exports.GoogleDriveSetupGatekeeperImpl({props}),
+        resource: GOOGLE_DRIVE_FOLDER_RESOURCE,
+      };
+    }
+
     // Default: Gmail
     let props: GmailGatekeeperImplProps = {...this.ctx.props};
 
@@ -1001,6 +907,13 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       return {
         iframeHtml: GOOGLE_SHEETS_CONFIGURATOR_HTML,
         ui: new RpcStub(new GoogleSheetsConfiguratorUI(getToken)),
+      };
+    }
+
+    if (resourceUrlPattern === GOOGLE_DRIVE_FOLDER_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: GOOGLE_DRIVE_SETUP_CONFIGURATOR_HTML,
+        ui: new RpcStub(new GoogleDriveSetupConfiguratorUI()),
       };
     }
 
@@ -2528,6 +2441,45 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
 // Google Sheets Gatekeeper
 // =======================================================================================
 
+// ── Sheets write action types ────────────────────────────────────────────
+
+type GoogleSheetsAction =
+  | { type: "appendRows"; range: string; values: SpreadsheetCellValue[][] }
+  | { type: "updateRange"; range: string; values: SpreadsheetCellValue[][] };
+
+/**
+ * Validate the `values` argument supplied by agent code before it is stored in the pending
+ * action store. Structural checks only — range validation happens in the API layer at
+ * applyAction time (same pattern as existing read methods).
+ */
+function validateSheetWriteValues(values: SpreadsheetCellValue[][], operation: string): void {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`${operation}: values must be a non-empty array of rows.`);
+  }
+  if (values.length > 1000) {
+    throw new Error(`${operation}: at most 1,000 rows may be written per call.`);
+  }
+  let totalCells = 0;
+  for (let i = 0; i < values.length; i++) {
+    let row = values[i];
+    if (!Array.isArray(row)) {
+      throw new Error(`${operation}: values[${i}] must be an array, not ${typeof row}.`);
+    }
+    for (let j = 0; j < row.length; j++) {
+      let cell = row[j];
+      if (cell !== null && typeof cell !== "string" && typeof cell !== "number" && typeof cell !== "boolean") {
+        throw new Error(
+          `${operation}: values[${i}][${j}] must be a string, number, boolean, or null.`,
+        );
+      }
+    }
+    totalCells += row.length;
+  }
+  if (totalCells > 50_000) {
+    throw new Error(`${operation}: at most 50,000 cells may be written per call.`);
+  }
+}
+
 type GoogleSheetsGatekeeperImplProps = {
   userObjectId: string;
   spreadsheetId: string;
@@ -2554,7 +2506,7 @@ export class GoogleSheetsGatekeeperImpl
     return {
       url: `https://docs.google.com/spreadsheets/d/${this.ctx.props.spreadsheetId}/edit`,
       title: spreadsheet.title,
-      snippet: `Google Spreadsheet: ${spreadsheet.title} (read-only)`,
+      snippet: `Google Spreadsheet: ${spreadsheet.title}`,
       suggestedBindingName: "GOOGLE_SHEET",
       tsType: "GoogleSpreadsheetSession",
     };
@@ -2570,20 +2522,50 @@ export class GoogleSheetsGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleSpreadsheetSession> {
     let api = new GoogleSheetsApi(opts => this.#getAccessToken(opts));
+    let pendingActions = new PendingActionStore<GoogleSheetsAction>(this.ctx.storage.kv);
     return new GoogleSpreadsheetSessionImpl(
-      api, this.ctx.props.spreadsheetId, approvalQueue.dup(),
+      api, this.ctx.props.spreadsheetId, approvalQueue.dup(), pendingActions,
     );
   }
 
-  /** Read-only — no side-effecting actions. */
-  async applyAction(_action: number): Promise<void> {
-    throw new Error("Google Sheets is read-only and implements no actions.");
+  async applyAction(actionId: number): Promise<void> {
+    let pendingActions = new PendingActionStore<GoogleSheetsAction>(this.ctx.storage.kv);
+    let action = pendingActions.get(actionId);
+    if (!action) {
+      throw new Error(`Unknown pending Sheets action: ${actionId}`);
+    }
+    let api = new GoogleSheetsApi(opts => this.#getAccessToken(opts));
+    switch (action.type) {
+      case "appendRows":
+        await api.appendRows(this.ctx.props.spreadsheetId, action.range, action.values);
+        break;
+      case "updateRange":
+        await api.updateRange(this.ctx.props.spreadsheetId, action.range, action.values);
+        break;
+      default:
+        action satisfies never;
+        throw new Error(`Unknown Sheets action type: ${(action as {type: string}).type}`);
+    }
+    pendingActions.remove(actionId);
   }
-  async rejectAction(_action: number): Promise<void> {
-    throw new Error("Google Sheets is read-only and implements no actions.");
+
+  async rejectAction(actionId: number): Promise<void | {restart?: boolean}> {
+    let pendingActions = new PendingActionStore<GoogleSheetsAction>(this.ctx.storage.kv);
+    if (!pendingActions.get(actionId)) {
+      throw new Error(`Unknown pending Sheets action: ${actionId}`);
+    }
+    pendingActions.remove(actionId);
   }
-  revertAction(_action: number): Promise<void> {
-    throw new Error("Google Sheets is read-only and implements no actions.");
+
+  revertAction(
+    _actionId: number,
+  ): Promise<void | {message?: string; canRetry?: boolean; restart?: boolean}> {
+    // Sheets writes cannot be auto-reverted (there is no reliable undo for arbitrary cell edits).
+    return Promise.resolve({
+      message:
+        "Google Sheets write actions cannot be auto-reverted. To undo, open the spreadsheet " +
+        "in Google Sheets and use Edit › Undo (Ctrl+Z / ⌘Z).",
+    });
   }
 
   /**
@@ -2609,16 +2591,19 @@ class GoogleSpreadsheetSessionImpl extends RpcTarget implements GoogleSpreadshee
   #api: GoogleSheetsApi;
   #spreadsheetId: string;
   #approvalQueue: RpcStub<ApprovalQueue>;
+  #pendingActions: PendingActionStore<GoogleSheetsAction>;
 
   constructor(
     api: GoogleSheetsApi,
     spreadsheetId: string,
     approvalQueue: RpcStub<ApprovalQueue>,
+    pendingActions: PendingActionStore<GoogleSheetsAction>,
   ) {
     super();
     this.#api = api;
     this.#spreadsheetId = spreadsheetId;
     this.#approvalQueue = approvalQueue;
+    this.#pendingActions = pendingActions;
   }
 
   [Symbol.dispose](): void {
@@ -2670,6 +2655,74 @@ class GoogleSpreadsheetSessionImpl extends RpcTarget implements GoogleSpreadshee
         "the connected spreadsheet.",
     });
     return result;
+  }
+
+  // ── Writes ───────────────────────────────────────────────────────────────
+
+  /**
+   * Append rows after the last row of data in `range`. Values are stored as RAW literals
+   * (never interpreted as formulas). Goes through the approval queue; never auto-approved.
+   */
+  async appendRows(range: string, values: SpreadsheetCellValue[][]): Promise<void> {
+    if (this.#pendingActions.list().length >= 20) {
+      throw new Error(
+        "Too many pending Sheets write actions. Resolve existing pending actions first.",
+      );
+    }
+    validateSheetWriteValues(values, "appendRows");
+
+    let action: GoogleSheetsAction = { type: "appendRows", range, values };
+    let actionId = this.#pendingActions.submit(action);
+    let firstRowPreview = values[0]
+      .map(c => c === null ? "(blank)" : String(c).slice(0, 30))
+      .join(" | ");
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Append ${values.length} row(s) to ${range}`),
+        description:
+          `Append **${values.length}** row(s) to range **${range}** in the connected spreadsheet.\n\n` +
+          formatApprovalField("First row preview", firstRowPreview) +
+          (values.length > 1 ? `\n\n*(and ${values.length - 1} more row(s))*` : "") +
+          "\n\nValues are written as RAW literals — no formula interpretation.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Overwrite a bounded rectangular range with `values`. Values are stored as RAW literals
+   * (never interpreted as formulas). Goes through the approval queue; never auto-approved.
+   */
+  async updateRange(range: string, values: SpreadsheetCellValue[][]): Promise<void> {
+    if (this.#pendingActions.list().length >= 20) {
+      throw new Error(
+        "Too many pending Sheets write actions. Resolve existing pending actions first.",
+      );
+    }
+    validateSheetWriteValues(values, "updateRange");
+
+    let action: GoogleSheetsAction = { type: "updateRange", range, values };
+    let actionId = this.#pendingActions.submit(action);
+    let firstRowPreview = values[0]
+      .map(c => c === null ? "(blank)" : String(c).slice(0, 30))
+      .join(" | ");
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Update range ${range} (${values.length} row(s))`),
+        description:
+          `Overwrite **${values.length}** row(s) in range **${range}** of the connected spreadsheet.\n\n` +
+          formatApprovalField("First row preview", firstRowPreview) +
+          (values.length > 1 ? `\n\n*(and ${values.length - 1} more row(s))*` : "") +
+          "\n\nValues are written as RAW literals — no formula interpretation.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
   }
 }
 
@@ -3774,5 +3827,477 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
       prohibitAllSharing: true,
     });
     return result;
+  }
+}
+
+// =======================================================================================
+// Google Drive Folder Gatekeeper
+//
+// Purpose: list, read, and create files/folders inside a connected Google Drive folder.
+//
+//   ✓ Lists files and folders in the connected Drive folder (observation, no approval).
+//   ✓ Gets folder metadata (name, URL) for the connected folder (observation).
+//   ✓ Creates subfolders, Google Docs, and Google Sheets (actions, require approval).
+//   ✓ All creations are idempotent — already-created items are reused.
+//   ✗ Does NOT delete or move existing files.
+//   ✗ Does NOT send email — use the Gmail gatekeeper for that.
+//
+// OAuth scopes required:
+//   drive        — read/write access to all Drive files and folders (including pre-existing).
+//   documents    — insert text into Google Docs via the Docs API.
+//   spreadsheets — write rows into Google Sheets via the Sheets API.
+//
+// NOTE: The class name GoogleDriveSetupGatekeeperImpl is preserved (rather than renamed to
+// GoogleDriveFolderGatekeeperImpl) to avoid a new Durable Object migration for existing
+// deployed instances.
+// =======================================================================================
+
+// ── Internal types ───────────────────────────────────────────────────────
+
+// Legacy type kept for backward-compatible deserialization of pending "setupWorkspace" actions
+// that may still be stored in existing Durable Object instances.
+type DriveWorkspaceSetupOptions = {
+  rootFolderName: string;
+  workspaceName: string;
+  childrenSheetHeaders: string[];
+  childrenSheetSampleRow: string[];
+  emailTemplateContent: string;
+};
+
+type GoogleDriveFolderAction =
+  | { type: "createFolder"; name: string }
+  | { type: "createDoc"; name: string; initialText?: string }
+  | { type: "createSheet"; name: string; initialRows?: string[][] }
+  /**
+   * scaffoldFolders: create one or more subfolders under a relative path inside the bound
+   * folder. parentPath is a list of folder names resolved sequentially from the bound
+   * folder (intermediate folders are created if absent). folderNames is the list of
+   * subfolders to create under the resolved leaf.
+   */
+  | { type: "scaffoldFolders"; parentPath: string[]; folderNames: string[] }
+  // Legacy action type kept for backward-compatible applyAction on existing DOs.
+  | { type: "setupWorkspace"; options: DriveWorkspaceSetupOptions };
+
+/**
+ * Validate a single Drive folder/path segment from agent input.
+ * Rules: non-empty, ≤ 255 chars, no slash, backslash, null byte, or ASCII control chars.
+ */
+function validateDriveSegment(segment: string, context: string): void {
+  if (typeof segment !== "string" || segment.length === 0) {
+    throw new Error(`${context}: folder name must not be empty.`);
+  }
+  if (segment.length > 255) {
+    throw new Error(`${context}: folder name must not exceed 255 characters.`);
+  }
+  // Reject slash (path traversal), backslash, null byte, and control characters.
+  if (/[\x00-\x1F/\\]/.test(segment)) {
+    throw new Error(
+      `${context}: folder name must not contain slash, backslash, or control characters.`,
+    );
+  }
+}
+
+/** For backward compat; kept as a type alias so legacy code in applyAction compiles. */
+type GoogleDriveSetupAction = GoogleDriveFolderAction;
+
+type GoogleDriveSetupGatekeeperImplProps = {
+  userObjectId: string;
+  /**
+   * The Drive folder ID this gatekeeper instance is bound to.
+   * undefined or "root" → My Drive root.
+   * A specific folder ID → a named subfolder in the user's Drive.
+   */
+  folderId?: string;
+};
+
+// ── Legacy constants (kept for backward-compat applyAction of "setupWorkspace" actions) ──
+
+const LEGACY_DEFAULT_EMAIL_TEMPLATE =
+  "Subject: Status update\n\n" +
+  "Hello,\n\n" +
+  "Add your update here...\n\n" +
+  "Regards,\n" +
+  "[Name]";
+
+const LEGACY_DEFAULT_DRIVE_WORKSPACE_OPTIONS: DriveWorkspaceSetupOptions = {
+  rootFolderName: "Foundation OS",
+  workspaceName: "Foundation OS Workspace",
+  childrenSheetHeaders: ["Name", "Email", "Notes"],
+  childrenSheetSampleRow: ["Example", "example@example.com", ""],
+  emailTemplateContent: LEGACY_DEFAULT_EMAIL_TEMPLATE,
+};
+
+const LEGACY_DRIVE_SETUP_CHILDREN_SHEET = "Children List";
+const LEGACY_DRIVE_SETUP_EMAIL_DOC = "Email Template";
+const LEGACY_DRIVE_SETUP_PHOTOS_FOLDER = "Photos";
+const LEGACY_DRIVE_SETUP_EXAMPLE_CHILD_FOLDER = "Example";
+const LEGACY_DRIVE_SETUP_RESULT_KEY = "driveWorkspaceResult";
+
+// ── Gatekeeper Durable Object ─────────────────────────────────────────────
+
+@validateRpc()
+export class GoogleDriveSetupGatekeeperImpl
+    extends DurableObject<Env, GoogleDriveSetupGatekeeperImplProps>
+    implements Gatekeeper<GoogleDriveFolderSession> {
+
+  #tokens = new AccessTokenCache(opts => {
+    let stub: DurableObjectStub<UserAccount> = this.ctx.exports.UserAccount.get(
+        this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    return stub.getAccessToken(opts);
+  });
+
+  async #getAccessToken(opts?: AccessTokenRequest): Promise<string> {
+    return this.#tokens.get(opts);
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    let folderId = this.ctx.props.folderId ?? "root";
+    let isRoot = !this.ctx.props.folderId || this.ctx.props.folderId === "root";
+    let folderUrl = isRoot
+      ? "https://drive.google.com/drive/my-drive"
+      : `https://drive.google.com/drive/folders/${folderId}`;
+    let title = isRoot ? "Google Drive (My Drive)" : "Google Drive Folder";
+    let snippet = isRoot
+      ? "List and manage files in your Google Drive root (My Drive). " +
+        "Call listFiles() to see contents, or createFolder/createDoc/createSheet() to add items."
+      : `List and manage files in Drive folder ${folderId}. ` +
+        "Call listFiles() to see contents, or createFolder/createDoc/createSheet() to add items.";
+    return {
+      url: folderUrl,
+      title,
+      snippet,
+      suggestedBindingName: "GOOGLE_DRIVE",
+      tsType: "GoogleDriveFolderSession",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return DRIVE_SETUP_TYPES_CODE;
+  }
+
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    // Workspace setup is a meaningful side effect — always require explicit approval.
+    return [];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleDriveFolderSession> {
+    let folderId = this.ctx.props.folderId ?? "root";
+    let pendingActions = new PendingActionStore<GoogleDriveFolderAction>(this.ctx.storage.kv);
+    return new GoogleDriveFolderSessionImpl(
+      opts => this.#getAccessToken(opts),
+      approvalQueue.dup(),
+      pendingActions,
+      folderId,
+    );
+  }
+
+  async applyAction(actionId: number): Promise<void> {
+    let pendingActions = new PendingActionStore<GoogleDriveFolderAction>(this.ctx.storage.kv);
+    let action = pendingActions.get(actionId);
+    if (!action) {
+      throw new Error(`Unknown pending Drive Folder action: ${actionId}`);
+    }
+
+    let api = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let folderId = this.ctx.props.folderId ?? "root";
+
+    switch (action.type) {
+      case "createFolder": {
+        await api.findOrCreateFolder(action.name, folderId === "root" ? undefined : folderId);
+        break;
+      }
+      case "createDoc": {
+        await api.findOrCreateDoc(
+          action.name,
+          folderId === "root" ? undefined : folderId,
+          action.initialText,
+        );
+        break;
+      }
+      case "createSheet": {
+        await api.findOrCreateSheet(
+          action.name,
+          folderId === "root" ? undefined : folderId,
+          action.initialRows,
+        );
+        break;
+      }
+      case "scaffoldFolders": {
+        // Walk parentPath segments from the bound folder, creating intermediate folders as needed.
+        // Then create each name in folderNames under the resolved leaf folder.
+        // All findOrCreateFolder calls are idempotent (existing folders are reused).
+        let currentFolderId: string | undefined =
+          folderId === "root" ? undefined : folderId;
+        for (let segment of action.parentPath) {
+          let result = await api.findOrCreateFolder(segment, currentFolderId);
+          currentFolderId = result.file.id;
+        }
+        for (let name of action.folderNames) {
+          await api.findOrCreateFolder(name, currentFolderId);
+        }
+        break;
+      }
+      case "setupWorkspace": {
+        // Legacy action from before this gatekeeper became generic.
+        // Kept for backward-compatible apply of pending "setupWorkspace" actions still queued
+        // in existing Durable Object instances.
+        let opts = action.options ?? LEGACY_DEFAULT_DRIVE_WORKSPACE_OPTIONS;
+        let created: string[] = [];
+        let reused: string[] = [];
+        function track(name: string, wasCreated: boolean): void {
+          (wasCreated ? created : reused).push(name);
+        }
+        let root = await api.findOrCreateFolder(opts.rootFolderName);
+        track(opts.rootFolderName, root.created);
+        let workspace = await api.findOrCreateFolder(opts.workspaceName, root.file.id);
+        track(opts.workspaceName, workspace.created);
+        let photos = await api.findOrCreateFolder(
+          LEGACY_DRIVE_SETUP_PHOTOS_FOLDER, workspace.file.id);
+        track(LEGACY_DRIVE_SETUP_PHOTOS_FOLDER, photos.created);
+        let exampleChild = await api.findOrCreateFolder(
+          LEGACY_DRIVE_SETUP_EXAMPLE_CHILD_FOLDER, photos.file.id);
+        track(LEGACY_DRIVE_SETUP_EXAMPLE_CHILD_FOLDER, exampleChild.created);
+        let sheet = await api.findOrCreateSheet(
+          LEGACY_DRIVE_SETUP_CHILDREN_SHEET,
+          workspace.file.id,
+          [opts.childrenSheetHeaders, opts.childrenSheetSampleRow],
+        );
+        track(LEGACY_DRIVE_SETUP_CHILDREN_SHEET, sheet.created);
+        let doc = await api.findOrCreateDoc(
+          LEGACY_DRIVE_SETUP_EMAIL_DOC,
+          workspace.file.id,
+          opts.emailTemplateContent,
+        );
+        track(LEGACY_DRIVE_SETUP_EMAIL_DOC, doc.created);
+        this.ctx.storage.kv.put(LEGACY_DRIVE_SETUP_RESULT_KEY, {
+          rootFolderId: root.file.id,
+          workspaceFolderId: workspace.file.id,
+          photosFolderId: photos.file.id,
+          exampleChildFolderId: exampleChild.file.id,
+          childrenListSheetId: sheet.file.id,
+          emailTemplateDocId: doc.file.id,
+          created,
+          reused,
+        });
+        break;
+      }
+      default: {
+        action satisfies never;
+        throw new Error(`Unknown Drive Folder action type: ${(action as {type: string}).type}`);
+      }
+    }
+
+    pendingActions.remove(actionId);
+  }
+
+  async rejectAction(actionId: number): Promise<void | {restart?: boolean}> {
+    let pendingActions = new PendingActionStore<GoogleDriveFolderAction>(this.ctx.storage.kv);
+    pendingActions.remove(actionId);
+  }
+
+  revertAction(
+    _action: number,
+  ): Promise<void | {message?: string; canRetry?: boolean; restart?: boolean}> {
+    // Drive files/folders can only be removed through the Drive UI.
+    return Promise.resolve({
+      message:
+        "Drive folder actions cannot be auto-reverted. To undo, open Google Drive and " +
+        "manually move the created folders and files to Trash.",
+    });
+  }
+
+  /**
+   * Observer access: Drive folder contents are private to the owner's account.
+   * Reject observer addition because no cross-user ACL verification can be performed
+   * without knowing which specific files were read.
+   */
+  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    throw new Error(
+      "Google Drive Folder connections cannot be shared with collaborators: " +
+      "Drive folder access is private to the connected account.");
+  }
+
+  async removeObserver(_id: string): Promise<void> {}
+}
+
+// ── Session interface and implementation ──────────────────────────────────
+
+// Internal TypeScript session type (the .txt file carries the agent-visible version with JSDoc).
+// Both must stay in sync. New methods: scaffoldFolders (nested folder scaffold under bound folder).
+interface GoogleDriveFolderSession {
+  listFiles(): Promise<import("./drive-setup-api").DriveFileEntry[]>;
+  getFolder(): Promise<import("./drive-setup-api").DriveFolderInfo>;
+  createFolder(name: string): Promise<void>;
+  createDoc(name: string, initialText?: string): Promise<void>;
+  createSheet(name: string, initialRows?: string[][]): Promise<void>;
+  /** Create subfolders under a relative path inside the bound folder. See drive-setup-types.txt. */
+  scaffoldFolders(parentPath: string | string[], folderNames: string[]): Promise<void>;
+}
+
+@validateRpc()
+class GoogleDriveFolderSessionImpl extends RpcTarget implements GoogleDriveFolderSession {
+  #getAccessToken: (opts?: AccessTokenRequest) => Promise<string>;
+  #approvalQueue: RpcStub<ApprovalQueue>;
+  #pendingActions: PendingActionStore<GoogleDriveFolderAction>;
+  /** The Drive folder ID this session is bound to. "root" = My Drive root. */
+  #folderId: string;
+
+  constructor(
+    getAccessToken: (opts?: AccessTokenRequest) => Promise<string>,
+    approvalQueue: RpcStub<ApprovalQueue>,
+    pendingActions: PendingActionStore<GoogleDriveFolderAction>,
+    folderId: string,
+  ) {
+    super();
+    this.#getAccessToken = getAccessToken;
+    this.#approvalQueue = approvalQueue;
+    this.#pendingActions = pendingActions;
+    this.#folderId = folderId;
+  }
+
+  async listFiles(): Promise<import("./drive-setup-api").DriveFileEntry[]> {
+    let api = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let files = await api.listFiles(this.#folderId === "root" ? undefined : this.#folderId);
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    await this.#approvalQueue.authorizeObservation({
+      title: `List files in ${folderLabel}`,
+      description: `Listed ${files.length} file(s) in ${folderLabel}.`,
+    });
+    return files;
+  }
+
+  async getFolder(): Promise<import("./drive-setup-api").DriveFolderInfo> {
+    let api = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let folder = await api.getFolder(this.#folderId);
+    await this.#approvalQueue.authorizeObservation({
+      title: `Read folder metadata: ${folder.name}`,
+      description: `Read name and URL for Drive folder "${folder.name}" (${folder.id}).`,
+    });
+    return folder;
+  }
+
+  async createFolder(name: string): Promise<void> {
+    let action: GoogleDriveFolderAction = { type: "createFolder", name };
+    let actionId = this.#pendingActions.submit(action);
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: `Create Drive folder: ${name}`,
+        description:
+          `Create subfolder **${name}** inside ${folderLabel}.\n\n` +
+          "If a folder with this name already exists, it will be reused.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  async createDoc(name: string, initialText?: string): Promise<void> {
+    let action: GoogleDriveFolderAction = { type: "createDoc", name, initialText };
+    let actionId = this.#pendingActions.submit(action);
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: `Create Google Doc: ${name}`,
+        description:
+          `Create Google Doc **${name}** inside ${folderLabel}.` +
+          (initialText ? `\n\nInitial content (first 200 chars):\n\`\`\`\n${initialText.slice(0, 200)}${initialText.length > 200 ? "..." : ""}\n\`\`\`` : "") +
+          "\n\nIf a Doc with this name already exists, it will be reused.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  async createSheet(name: string, initialRows?: string[][]): Promise<void> {
+    let action: GoogleDriveFolderAction = { type: "createSheet", name, initialRows };
+    let actionId = this.#pendingActions.submit(action);
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    let rowDesc = initialRows && initialRows.length > 0
+      ? `\n\nFirst row: ${initialRows[0].join(" | ")}` +
+        (initialRows.length > 1 ? ` (and ${initialRows.length - 1} more row(s))` : "")
+      : "";
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: `Create Google Sheet: ${name}`,
+        description:
+          `Create Google Sheet **${name}** inside ${folderLabel}.${rowDesc}\n\n` +
+          "If a Sheet with this name already exists, it will be reused.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Create subfolders under a relative path inside the bound folder.
+   * parentPath is resolved sequentially from the bound folder — no raw Drive IDs.
+   * All operations are idempotent (existing folders are reused).
+   */
+  async scaffoldFolders(parentPath: string | string[], folderNames: string[]): Promise<void> {
+    // Normalise: string → single-element array; empty string → empty path
+    let pathSegments: string[] = Array.isArray(parentPath)
+      ? parentPath
+      : (parentPath.length > 0 ? [parentPath] : []);
+
+    // Validate path segments
+    if (pathSegments.length > 10) {
+      throw new Error("scaffoldFolders: parentPath may contain at most 10 segments.");
+    }
+    for (let i = 0; i < pathSegments.length; i++) {
+      validateDriveSegment(pathSegments[i], `scaffoldFolders: parentPath[${i}]`);
+    }
+
+    // Validate folder names
+    if (!Array.isArray(folderNames) || folderNames.length === 0) {
+      throw new Error("scaffoldFolders: folderNames must be a non-empty array.");
+    }
+    if (folderNames.length > 50) {
+      throw new Error("scaffoldFolders: at most 50 folders may be created per call.");
+    }
+    for (let i = 0; i < folderNames.length; i++) {
+      validateDriveSegment(folderNames[i], `scaffoldFolders: folderNames[${i}]`);
+    }
+
+    let action: GoogleDriveFolderAction = {
+      type: "scaffoldFolders",
+      parentPath: pathSegments,
+      folderNames,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    let pathLabel = pathSegments.length > 0
+      ? `**${pathSegments.join(" → ")}** (inside ${folderLabel})`
+      : folderLabel;
+    let namesPreview = folderNames.slice(0, 5).map(n => `- **${n}**`).join("\n");
+    if (folderNames.length > 5) namesPreview += `\n- *(and ${folderNames.length - 5} more)*`;
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(
+          pathSegments.length > 0
+            ? `Create folders in ${pathSegments[pathSegments.length - 1]}`
+            : `Create ${folderNames.length} folder(s) in ${folderLabel}`,
+        ),
+        description:
+          `Create the following subfolder(s) under ${pathLabel}:\n\n${namesPreview}\n\n` +
+          (pathSegments.length > 0
+            ? `Intermediate path folder(s) (**${pathSegments.join(" → ")}**) will be created ` +
+              "if they do not already exist.\n\n"
+            : "") +
+          "Existing folders with matching names are reused (idempotent).",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
   }
 }

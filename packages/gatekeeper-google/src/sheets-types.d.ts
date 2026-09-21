@@ -48,7 +48,30 @@ export type SpreadsheetRange = {
   values: SpreadsheetCellValue[][];
 };
 
-/** Read-only access to one selected Google spreadsheet. */
+/**
+ * Read and write access to one selected Google spreadsheet.
+ *
+ * READS (no approval required):
+ *   getSpreadsheet(), readRange(), readRanges() — return data as observations.
+ *
+ * WRITES (require user approval before executing):
+ *   appendRows() — append new rows after the last row of data in a range.
+ *   updateRange() — overwrite a bounded rectangular range with new values.
+ *
+ * All writes use valueInputOption=RAW: values are stored as-is and are never
+ * interpreted as formulas, regardless of leading characters. There is no
+ * auto-formula injection risk.
+ *
+ * The bound spreadsheetId cannot be changed; all writes are confined to the
+ * connected spreadsheet. Writes go through the approval queue — they are
+ * never auto-approved and never executed before the user confirms.
+ *
+ * NOT AVAILABLE on this session:
+ *   ✗ Creating or deleting sheets/tabs
+ *   ✗ Formatting, merging cells, or changing column widths
+ *   ✗ Batch updates (batchUpdate API)
+ *   ✗ Reading/writing other spreadsheets (spreadsheetId is fixed at binding time)
+ */
 export interface GoogleSpreadsheetSession {
   /** Return spreadsheet metadata and its worksheet list. */
   getSpreadsheet(): Promise<SpreadsheetInfo>;
@@ -71,4 +94,34 @@ export interface GoogleSpreadsheetSession {
     ranges: string[],
     options?: { valueMode?: SpreadsheetValueMode },
   ): Promise<SpreadsheetRange[]>;
+
+  /**
+   * Submit a request to append rows after the last row of data in `range`.
+   * Values are stored as RAW literals — no formula parsing, no injection risk.
+   * The range must be a bounded A1 range, e.g. `'Alunos'!A1:F1000`.
+   * At most 1,000 rows and 50,000 cells may be written per call.
+   * Requires user approval before the data is written.
+   *
+   * Example: append a new student record
+   *   await session.appendRows("Alunos!A1:F1", [["Ana", "2025-09-01", "Turma A"]]);
+   */
+  appendRows(
+    range: string,
+    values: SpreadsheetCellValue[][],
+  ): Promise<void>;
+
+  /**
+   * Submit a request to overwrite a bounded rectangular range with `values`.
+   * Values are stored as RAW literals — no formula parsing, no injection risk.
+   * The range must be a bounded A1 range; the values array must fit within it.
+   * At most 1,000 rows and 50,000 cells may be written per call.
+   * Requires user approval before the data is written.
+   *
+   * Example: update a student record in row 5
+   *   await session.updateRange("Alunos!A5:C5", [["Ana", "2025-09-01", "Turma B"]]);
+   */
+  updateRange(
+    range: string,
+    values: SpreadsheetCellValue[][],
+  ): Promise<void>;
 }

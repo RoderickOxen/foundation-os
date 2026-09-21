@@ -1184,12 +1184,37 @@ export const SUGGESTED_MODELS: Record<
   Record<string, {name: string, contextWindow: number, outputLimit?: number}>
 > = {
   "cloudflare": {
+    "@cf/openai/gpt-oss-20b": {
+      name: "Draft emails & quick replies — GPT OSS 20B (Workers AI)", contextWindow: 128000,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
+    "@cf/openai/gpt-oss-120b": {
+      name: "Polish important writing — GPT OSS 120B (Workers AI)", contextWindow: 128000,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
+    "@cf/qwen/qwen2.5-coder-32b-instruct": {
+      name: "Code specialist — Qwen2.5-Coder 32B (Workers AI)", contextWindow: 32768,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
+    "@cf/meta/llama-3.2-3b-instruct": {
+      name: "Cheap simple PT/EN tasks — Llama 3.2 3B (Workers AI)", contextWindow: 80000,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b": {
+      name: "Hard reasoning — DeepSeek R1 Distill Qwen 32B (Workers AI)", contextWindow: 80000,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
+    "@cf/mistralai/mistral-small-3.1-24b-instruct": {
+      name: "Summarize long docs — Mistral Small 3.1 24B (Workers AI)", contextWindow: 128000,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
     "@cf/moonshotai/kimi-k2.7-code": {
-      name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
+      name: "Large coding changes — Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
       outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
     "@cf/zai-org/glm-5.2": {
-      name: "GLM 5.2 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+      name: "Multilingual chat — GLM 5.2 (Workers AI)", contextWindow: 262144,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
   },
   "anthropic": {

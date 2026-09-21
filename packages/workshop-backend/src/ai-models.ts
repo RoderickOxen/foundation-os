@@ -258,6 +258,46 @@ function getHeader(headers: Record<string, string>, name: string): string | unde
   return undefined;
 }
 
+/**
+ * Normalize an OpenAI-compatible chat completions payload for Cloudflare Workers AI's stricter
+ * request schema. Workers AI's `/workers-ai/v1/chat/completions` endpoint rejects content
+ * arrays; it requires every message to carry a plain string (not an array).
+ *
+ * Called only for `cloudflare-workers-ai` handles in the `onPayload` hook; all other providers
+ * are unaffected.
+ *
+ * Two normalizations applied:
+ *  - **User messages with content arrays**: text blocks are joined with `"\n"`. Non-text blocks
+ *    (e.g. image_url) are dropped because pi's `transformMessages` already replaced unsupported
+ *    images with text placeholders before the payload was built.
+ *  - **Assistant messages with null content**: replaced with `""`. Workers AI rejects null even
+ *    when `tool_calls` is present on the same message.
+ */
+function normalizeForWorkersAi(payload: unknown): unknown {
+  if (typeof payload !== "object" || payload === null) return payload;
+  const body = payload as Record<string, unknown>;
+  if (!Array.isArray(body.messages)) return payload;
+
+  const messages = (body.messages as Record<string, unknown>[]).map((msg) => {
+    if (typeof msg !== "object" || msg === null) return msg;
+    if (Array.isArray(msg.content)) {
+      // Flatten content arrays to a plain string. Images were already downgraded to text
+      // placeholders by pi's transformMessages before this payload was built.
+      const text = (msg.content as { type?: string; text?: string }[])
+          .filter((b) => b.type === "text" && typeof b.text === "string")
+          .map((b) => b.text!)
+          .join("\n");
+      return { ...msg, content: text };
+    }
+    // Workers AI rejects null content on assistant messages even when tool_calls are present.
+    if (msg.role === "assistant" && msg.content === null) {
+      return { ...msg, content: "" };
+    }
+    return msg;
+  });
+  return { ...body, messages };
+}
+
 type HandleArgs = {
   model: Model<Api>;
   // Provider auth: a plain API key (pi turns it into the SDK's native auth) and/or headers.
@@ -336,9 +376,15 @@ function makeHandle(args: HandleArgs): ModelHandle {
         },
         // PDF attachments ride pi image parts and are rewritten here into the provider's native
         // document blocks (no-op for payloads without one; see chat-attachment-pdf.ts).
+        // Workers AI also needs content-array flattening (see normalizeForWorkersAi).
         onPayload: async (payload, payloadModel) => {
           const replaced = await options.onPayload?.(payload, payloadModel);
-          return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
+          const afterPdf = bridgePdfAttachments(args.model.api, replaced ?? payload);
+          const normalized = afterPdf ?? replaced;
+          if (args.model.provider === "cloudflare-workers-ai") {
+            return normalizeForWorkersAi(normalized ?? payload);
+          }
+          return normalized;
         },
       };
       return streamFn(model, context, merged);

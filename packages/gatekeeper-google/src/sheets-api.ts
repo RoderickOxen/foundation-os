@@ -11,6 +11,9 @@ const MAX_RANGE_LENGTH = 500;
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
+// Write caps: match read caps for consistency.
+const MAX_WRITE_ROWS = 1000;
+const MAX_WRITE_TOTAL_CELLS = 50_000;
 
 type GoogleErrorResponse = {
   error?: { message?: string };
@@ -111,6 +114,11 @@ function normalizeCell(value: unknown): SpreadsheetCellValue {
   throw new Error("Google Sheets returned an unsupported cell value.");
 }
 
+/** Serialize a cell value for the RAW write API. null → "" (clears the cell). */
+function serializeWriteCell(value: SpreadsheetCellValue): unknown {
+  return value === null ? "" : value;
+}
+
 function normalizeRange(rest: RestValueRange, requested: ValidatedRange): SpreadsheetRange {
   let source = Array.isArray(rest.values) ? rest.values : [];
   let values = Array.from({ length: requested.rows }, (_row, rowIndex) => {
@@ -168,7 +176,6 @@ export class GoogleSheetsApi {
     let response = await fetchWithAuthRetry(
       url.toString(), {}, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
     );
-
     let text: string;
     try {
       text = await readResponseText(
@@ -244,5 +251,143 @@ export class GoogleSheetsApi {
     let result = await this.#request<{ valueRanges?: RestValueRange[] }>(url);
     let returned = result.valueRanges ?? [];
     return validated.map((range, index) => normalizeRange(returned[index] ?? {}, range));
+  }
+
+  // ── Write helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Internal: POST or PUT with a JSON body, using the same auth-retry and response-size guards as
+   * the read path. Returns the parsed response body (caller may discard it).
+   */
+  async #mutate<T>(url: URL, method: "POST" | "PUT", payload: unknown): Promise<T> {
+    let response = await fetchWithAuthRetry(
+      url.toString(),
+      {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+      this.getAccessToken,
+      { timeoutMs: REQUEST_TIMEOUT_MS },
+    );
+
+    let text: string;
+    try {
+      text = await readResponseText(
+        response, response.ok ? MAX_RESPONSE_BYTES : MAX_ERROR_RESPONSE_BYTES,
+      );
+    } catch (error) {
+      if (!response.ok) {
+        throw new Error(
+          `Google Sheets request failed [http=${response.status}]`, { cause: error },
+        );
+      }
+      throw error;
+    }
+
+    let responseBody: unknown;
+    try {
+      responseBody = JSON.parse(text);
+    } catch {
+      if (!response.ok) {
+        throw new Error(`Google Sheets request failed [http=${response.status}]`);
+      }
+      throw new Error("Google Sheets returned an invalid JSON response.");
+    }
+
+    if (!response.ok) {
+      let errorBody = responseBody as GoogleErrorResponse;
+      let detail = errorBody?.error?.message ? `: ${errorBody.error.message}` : "";
+      throw new Error(`Google Sheets request failed [http=${response.status}]${detail}`);
+    }
+    return responseBody as T;
+  }
+
+  /**
+   * Append rows after the last row of data in `range` (using valueInputOption=RAW — values are
+   * treated as literals, never as formulas). The range is validated and bounded exactly like reads.
+   * At most 1,000 rows and 50,000 cells may be written per call.
+   *
+   * This is the low-level API method called by applyAction; session-level validation happens
+   * in GoogleSpreadsheetSessionImpl.appendRows.
+   */
+  async appendRows(
+    spreadsheetId: string,
+    range: string,
+    values: SpreadsheetCellValue[][],
+  ): Promise<void> {
+    let validated = validateRange(range);
+    if (!Array.isArray(values) || values.length === 0) {
+      throw new Error("appendRows requires at least one row of values.");
+    }
+    if (values.length > MAX_WRITE_ROWS) {
+      throw new Error(`appendRows may write at most ${MAX_WRITE_ROWS} rows per call.`);
+    }
+    let totalCells = values.reduce(
+      (sum, row) => sum + (Array.isArray(row) ? row.length : 0), 0,
+    );
+    if (totalCells > MAX_WRITE_TOTAL_CELLS) {
+      throw new Error(
+        `appendRows may write at most ${MAX_WRITE_TOTAL_CELLS.toLocaleString()} cells per call.`,
+      );
+    }
+    let url = new URL(
+      `${API_BASE}/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(validated.range)}:append`,
+    );
+    url.searchParams.set("valueInputOption", "RAW");
+    await this.#mutate<unknown>(url, "POST", {
+      values: values.map(row => (Array.isArray(row) ? row : []).map(serializeWriteCell)),
+    });
+  }
+
+  /**
+   * Overwrite cells in `range` with `values` (using valueInputOption=RAW — values are treated as
+   * literals, never as formulas). The range is validated and bounded exactly like reads.
+   * The values must fit within the declared range dimensions.
+   * At most 1,000 rows and 50,000 cells may be written per call.
+   *
+   * This is the low-level API method called by applyAction; session-level validation happens
+   * in GoogleSpreadsheetSessionImpl.updateRange.
+   */
+  async updateRange(
+    spreadsheetId: string,
+    range: string,
+    values: SpreadsheetCellValue[][],
+  ): Promise<void> {
+    let validated = validateRange(range);
+    if (!Array.isArray(values) || values.length === 0) {
+      throw new Error("updateRange requires at least one row of values.");
+    }
+    if (values.length > MAX_WRITE_ROWS) {
+      throw new Error(`updateRange may write at most ${MAX_WRITE_ROWS} rows per call.`);
+    }
+    let totalCells = values.reduce(
+      (sum, row) => sum + (Array.isArray(row) ? row.length : 0), 0,
+    );
+    if (totalCells > MAX_WRITE_TOTAL_CELLS) {
+      throw new Error(
+        `updateRange may write at most ${MAX_WRITE_TOTAL_CELLS.toLocaleString()} cells per call.`,
+      );
+    }
+    if (values.length > validated.rows) {
+      throw new Error(
+        `updateRange: ${values.length} data row(s) exceed the ${validated.rows}-row range "${range}".`,
+      );
+    }
+    let maxCols = Math.max(...values.map(row => (Array.isArray(row) ? row.length : 0)));
+    if (maxCols > validated.columns) {
+      throw new Error(
+        `updateRange: a data row has ${maxCols} column(s) which exceeds the ` +
+        `${validated.columns}-column range "${range}".`,
+      );
+    }
+    let url = new URL(
+      `${API_BASE}/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(validated.range)}`,
+    );
+    url.searchParams.set("valueInputOption", "RAW");
+    await this.#mutate<unknown>(url, "PUT", {
+      range: validated.range,
+      values: values.map(row => (Array.isArray(row) ? row : []).map(serializeWriteCell)),
+    });
   }
 }

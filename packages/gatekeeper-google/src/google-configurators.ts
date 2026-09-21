@@ -6,6 +6,7 @@ import { GoogleAccessToken } from "./google-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
 import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurator-types";
 import type { GmailConfiguratorRpc } from "./configurator/gmail-configurator-types";
+import type { GoogleDriveSetupConfiguratorRpc } from "./configurator/google-drive-setup-configurator-types";
 import type { GoogleDocConfiguratorRpc } from "./configurator/google-doc-configurator-types";
 import type { GoogleSheetsConfiguratorRpc } from "./configurator/google-sheets-configurator-types";
 
@@ -124,6 +125,10 @@ async function listDriveFiles(
 // RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
 @validateRpc()
 export class GmailConfiguratorUI extends RpcTarget implements GmailConfiguratorRpc {}
+
+// RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
+@validateRpc()
+export class GoogleDriveSetupConfiguratorUI extends RpcTarget implements GoogleDriveSetupConfiguratorRpc {}
 
 // RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
 @validateRpc()

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
@@ -565,5 +566,175 @@ describe("PDF attachment bridging", () => {
       type: "input_image",
       image_url: "data:image/png;base64,iVBOR",
     }));
+  }, 15000);
+});
+
+// Shared zero-cost usage fixture for synthesized assistant messages.
+const ZERO_USAGE: AssistantMessage["usage"] = {
+  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/**
+ * Regression tests for Workers AI payload normalization (normalizeForWorkersAi).
+ *
+ * Workers AI's OpenAI-compatible `/workers-ai/v1/chat/completions` endpoint rejects:
+ *   - User/assistant message content arrays (requires plain strings)
+ *   - Null assistant content (requires "" when tool_calls is present)
+ *
+ * These tests drive the real pi-ai stack with an injected fetch stub so the captured
+ * request body reflects exactly what would be sent over the wire to Workers AI.
+ */
+describe("Workers AI payload normalization", () => {
+  beforeEach(() => {
+    capturedRequests.length = 0;
+  });
+
+  /** Drive handle.stream() and return the parsed request body sent to the provider. */
+  async function captureBody(
+    handle: ModelHandle, messages: Message[],
+  ): Promise<Record<string, unknown>> {
+    const stream = handle.stream(handle.model, { messages }, { fetch: fetchStub, maxRetries: 0 });
+    const result = await stream.result();
+    expect(result.stopReason).toBe("error");
+    expect(capturedRequests.length).toBeGreaterThan(0);
+    return JSON.parse(capturedRequests[0].body) as Record<string, unknown>;
+  }
+
+  it("flattens a user message content array to a plain string for Workers AI", async () => {
+    // Scenario: user sent a message with an image attachment. pi's transformMessages already
+    // replaced the image block with a text placeholder (Workers AI has input:["text"]). The
+    // remaining content array must be flattened to a string before the request goes out.
+    const handle = getModel(env({ CF_AI_GATEWAY_PROVIDERS: "cloudflare" }), WORKERS_AI_CONFIG, INITIATOR);
+    const body = await captureBody(handle, [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is in this image?" },
+          { type: "text", text: "(image omitted: model does not support images)" },
+        ],
+        timestamp: 0,
+      },
+    ]);
+
+    const messages = body.messages as { role: string; content: unknown }[];
+    const userMsg = messages.find((m) => m.role === "user");
+    expect(typeof userMsg?.content).toBe("string");
+    expect(userMsg?.content).toContain("What is in this image?");
+    expect(userMsg?.content).toContain("(image omitted: model does not support images)");
+  }, 15000);
+
+  it("replaces null assistant content with empty string for Workers AI", async () => {
+    // Scenario: replay of a prior turn where the assistant made a tool call with no text.
+    // pi's openai-completions serializer produces content:null when there is no text, which
+    // Workers AI rejects; normalizeForWorkersAi must replace it with "".
+    const handle = getModel(env({ CF_AI_GATEWAY_PROVIDERS: "cloudflare" }), WORKERS_AI_CONFIG, INITIATOR);
+    const body = await captureBody(handle, [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "executeCode", arguments: {} }],
+        api: "openai-completions",
+        provider: "cloudflare-workers-ai",
+        model: WORKERS_AI_CONFIG.model,
+        usage: ZERO_USAGE,
+        stopReason: "toolUse",
+        timestamp: 0,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "executeCode",
+        content: [{ type: "text", text: "ok" }],
+        isError: false,
+        timestamp: 0,
+      },
+      // Context must end with a user/toolResult message; add a follow-up user turn.
+      { role: "user", content: "Continue.", timestamp: 0 },
+    ]);
+
+    const messages = body.messages as { role: string; content: unknown; tool_calls?: unknown }[];
+    // The assistant message with tool_calls must have "" not null content.
+    const assistantMsg = messages.find((m) => m.role === "assistant" && m.tool_calls);
+    expect(assistantMsg).toBeDefined();
+    expect(assistantMsg?.content).toBe("");
+  }, 15000);
+
+  it("does not flatten content arrays for non-Workers-AI providers", async () => {
+    // Anthropic natively supports content-part arrays; normalizeForWorkersAi must not run.
+    const handle = getModel(env(), ANTHROPIC_CONFIG, INITIATOR);
+    const body = await captureBody(handle, [
+      {
+        role: "user",
+        content: [{ type: "text", text: "Hello Anthropic." }],
+        timestamp: 0,
+      },
+    ]);
+    // Anthropic's adapter serializes under `messages`. Content may be string or array depending
+    // on the pi version, but it must NOT have been collapsed by our Workers AI normalizer — the
+    // Anthropic adapter owns that decision. We verify the handle's api is anthropic-messages so
+    // the normalizer path is not taken.
+    expect(handle.model.api).toBe("anthropic-messages");
+    expect(handle.model.provider).toBe("anthropic");
+    // Confirm the request reached the Anthropic gateway route (not the workers-ai route).
+    expect(capturedRequests[0].url).toContain("/anthropic/");
+  }, 15000);
+
+  it("normalizes a full replay history: assistant tool call + tool result + follow-up user turn", async () => {
+    // End-to-end regression: multi-message history as produced by agent replay after a Google
+    // connection routes to Workers AI via the user's own AI Gateway. This is the scenario that
+    // triggered the original 400 schema error.
+    const handle = getModel(
+      env({ CF_AI_GATEWAY_PROVIDERS: "cloudflare" }),
+      WORKERS_AI_CONFIG,
+      INITIATOR,
+      { userGateway: { accountId: "user-account-id", apiKey: "user-token" } },
+    );
+    const body = await captureBody(handle, [
+      // User message with a text+image array (image already downgraded to a text placeholder
+      // by pi's transformMessages before the payload is built).
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image." },
+          { type: "text", text: "(image omitted: model does not support images)" },
+        ],
+        timestamp: 0,
+      },
+      // Tool-only assistant turn (no text block → content would be null in the raw payload).
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-2", name: "executeCode", arguments: {} }],
+        api: "openai-completions",
+        provider: "cloudflare-workers-ai",
+        model: WORKERS_AI_CONFIG.model,
+        usage: ZERO_USAGE,
+        stopReason: "toolUse",
+        timestamp: 0,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-2",
+        toolName: "executeCode",
+        content: [{ type: "text", text: "done" }],
+        isError: false,
+        timestamp: 0,
+      },
+      { role: "user", content: "What next?", timestamp: 0 },
+    ]);
+
+    const messages = body.messages as { role: string; content: unknown; tool_calls?: unknown }[];
+    // Every message's content must be a string (or "" for null-assistant).
+    for (const msg of messages) {
+      expect(typeof msg.content, `message role=${msg.role} has non-string content`).toBe("string");
+    }
+    // The user message that had a content array should be joined.
+    const firstUser = messages.find((m) => m.role === "user");
+    expect(firstUser?.content).toContain("Describe this image.");
+    expect(firstUser?.content).toContain("(image omitted: model does not support images)");
+    // The assistant message with tool_calls has "" not null.
+    const assistantMsg = messages.find((m) => m.role === "assistant" && m.tool_calls);
+    expect(assistantMsg?.content).toBe("");
+    // The request went to the user's AI Gateway workers-ai route.
+    expect(capturedRequests[0].url).toContain("user-account-id/default/workers-ai/");
   }, 15000);
 });

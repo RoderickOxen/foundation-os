@@ -3869,6 +3869,18 @@ type GoogleDriveFolderAction =
   | { type: "createDoc"; name: string; initialText?: string }
   | { type: "createSheet"; name: string; initialRows?: string[][] }
   /**
+   * createDocAtPath: create a Google Doc under a relative path inside the bound folder.
+   * parentPath segments are resolved sequentially from the bound folder (intermediate
+   * folders are created idempotently). Empty parentPath creates in the bound folder.
+   */
+  | { type: "createDocAtPath"; parentPath: string[]; name: string; initialText?: string }
+  /**
+   * createSheetAtPath: create a Google Sheet under a relative path inside the bound folder.
+   * parentPath segments are resolved sequentially from the bound folder (intermediate
+   * folders are created idempotently). Empty parentPath creates in the bound folder.
+   */
+  | { type: "createSheetAtPath"; parentPath: string[]; name: string; initialRows?: string[][] }
+  /**
    * scaffoldFolders: create one or more subfolders under a relative path inside the bound
    * folder. parentPath is a list of folder names resolved sequentially from the bound
    * folder (intermediate folders are created if absent). folderNames is the list of
@@ -3959,9 +3971,11 @@ export class GoogleDriveSetupGatekeeperImpl
     let title = isRoot ? "Google Drive (My Drive)" : "Google Drive Folder";
     let snippet = isRoot
       ? "List and manage files in your Google Drive root (My Drive). " +
-        "Call listFiles() to see contents, or createFolder/createDoc/createSheet() to add items."
+        "Call listFiles() to see contents, createFolder/createDoc/createSheet() to add items " +
+        "directly, or createDocAtPath/createSheetAtPath/scaffoldFolders() to work inside nested subfolders."
       : `List and manage files in Drive folder ${folderId}. ` +
-        "Call listFiles() to see contents, or createFolder/createDoc/createSheet() to add items.";
+        "Call listFiles() to see contents, createFolder/createDoc/createSheet() to add items " +
+        "directly, or createDocAtPath/createSheetAtPath/scaffoldFolders() to work inside nested subfolders.";
     return {
       url: folderUrl,
       title,
@@ -4020,6 +4034,28 @@ export class GoogleDriveSetupGatekeeperImpl
           folderId === "root" ? undefined : folderId,
           action.initialRows,
         );
+        break;
+      }
+      case "createDocAtPath": {
+        // Walk parentPath from the bound folder, creating intermediate folders idempotently,
+        // then find-or-create the Doc under the resolved leaf.
+        let docPathId: string | undefined = folderId === "root" ? undefined : folderId;
+        for (let segment of action.parentPath) {
+          let result = await api.findOrCreateFolder(segment, docPathId);
+          docPathId = result.file.id;
+        }
+        await api.findOrCreateDoc(action.name, docPathId, action.initialText);
+        break;
+      }
+      case "createSheetAtPath": {
+        // Walk parentPath from the bound folder, creating intermediate folders idempotently,
+        // then find-or-create the Sheet under the resolved leaf.
+        let sheetPathId: string | undefined = folderId === "root" ? undefined : folderId;
+        for (let segment of action.parentPath) {
+          let result = await api.findOrCreateFolder(segment, sheetPathId);
+          sheetPathId = result.file.id;
+        }
+        await api.findOrCreateSheet(action.name, sheetPathId, action.initialRows);
         break;
       }
       case "scaffoldFolders": {
@@ -4123,7 +4159,8 @@ export class GoogleDriveSetupGatekeeperImpl
 // ── Session interface and implementation ──────────────────────────────────
 
 // Internal TypeScript session type (the .txt file carries the agent-visible version with JSDoc).
-// Both must stay in sync. New methods: scaffoldFolders (nested folder scaffold under bound folder).
+// Both must stay in sync.
+// Nested path methods added: scaffoldFolders, createDocAtPath, createSheetAtPath.
 interface GoogleDriveFolderSession {
   listFiles(): Promise<import("./drive-setup-api").DriveFileEntry[]>;
   getFolder(): Promise<import("./drive-setup-api").DriveFolderInfo>;
@@ -4132,6 +4169,10 @@ interface GoogleDriveFolderSession {
   createSheet(name: string, initialRows?: string[][]): Promise<void>;
   /** Create subfolders under a relative path inside the bound folder. See drive-setup-types.txt. */
   scaffoldFolders(parentPath: string | string[], folderNames: string[]): Promise<void>;
+  /** Create a Google Doc under a relative path inside the bound folder. See drive-setup-types.txt. */
+  createDocAtPath(parentPath: string | string[], name: string, initialText?: string): Promise<void>;
+  /** Create a Google Sheet under a relative path inside the bound folder. See drive-setup-types.txt. */
+  createSheetAtPath(parentPath: string | string[], name: string, initialRows?: string[][]): Promise<void>;
 }
 
 @validateRpc()
@@ -4227,6 +4268,128 @@ class GoogleDriveFolderSessionImpl extends RpcTarget implements GoogleDriveFolde
         description:
           `Create Google Sheet **${name}** inside ${folderLabel}.${rowDesc}\n\n` +
           "If a Sheet with this name already exists, it will be reused.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  // ── Path-aware Doc / Sheet creation ──────────────────────────────────────
+
+  /**
+   * Shared helper: normalise agent-supplied parentPath (string | string[]) to a validated
+   * string[] and throw early on bad input. Called by createDocAtPath and createSheetAtPath.
+   */
+  #resolvePathSegments(parentPath: string | string[], method: string): string[] {
+    let segments: string[] = Array.isArray(parentPath)
+      ? parentPath
+      : (parentPath.length > 0 ? [parentPath] : []);
+    if (segments.length > 10) {
+      throw new Error(`${method}: parentPath may contain at most 10 segments.`);
+    }
+    for (let i = 0; i < segments.length; i++) {
+      validateDriveSegment(segments[i], `${method}: parentPath[${i}]`);
+    }
+    return segments;
+  }
+
+  /**
+   * Submit a request to create a Google Doc under a relative path inside the bound folder.
+   * Intermediate folders are created idempotently. Requires user approval before executing.
+   */
+  async createDocAtPath(
+    parentPath: string | string[],
+    name: string,
+    initialText?: string,
+  ): Promise<void> {
+    let pathSegments = this.#resolvePathSegments(parentPath, "createDocAtPath");
+    validateDriveSegment(name, "createDocAtPath: name");
+
+    let action: GoogleDriveFolderAction = {
+      type: "createDocAtPath",
+      parentPath: pathSegments,
+      name,
+      initialText,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    let pathLabel = pathSegments.length > 0
+      ? `**${pathSegments.join(" → ")}** (inside ${folderLabel})`
+      : folderLabel;
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(
+          pathSegments.length > 0
+            ? `Create Doc "${name}" in ${pathSegments[pathSegments.length - 1]}`
+            : `Create Google Doc: ${name}`,
+        ),
+        description:
+          `Create Google Doc **${name}** inside ${pathLabel}.` +
+          (initialText
+            ? `\n\nInitial content (first 200 chars):\n\`\`\`\n` +
+              `${initialText.slice(0, 200)}${initialText.length > 200 ? "..." : ""}\n\`\`\``
+            : "") +
+          "\n\n" +
+          (pathSegments.length > 0
+            ? `Intermediate folder(s) (**${pathSegments.join(" → ")}**) will be created ` +
+              "if they do not already exist.\n\n"
+            : "") +
+          "If a Doc with this name already exists in that folder, it will be reused.",
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Submit a request to create a Google Sheet under a relative path inside the bound folder.
+   * Intermediate folders are created idempotently. Requires user approval before executing.
+   */
+  async createSheetAtPath(
+    parentPath: string | string[],
+    name: string,
+    initialRows?: string[][],
+  ): Promise<void> {
+    let pathSegments = this.#resolvePathSegments(parentPath, "createSheetAtPath");
+    validateDriveSegment(name, "createSheetAtPath: name");
+
+    let action: GoogleDriveFolderAction = {
+      type: "createSheetAtPath",
+      parentPath: pathSegments,
+      name,
+      initialRows,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    let pathLabel = pathSegments.length > 0
+      ? `**${pathSegments.join(" → ")}** (inside ${folderLabel})`
+      : folderLabel;
+    let rowDesc = initialRows && initialRows.length > 0
+      ? `\n\nFirst row: ${initialRows[0].join(" | ")}` +
+        (initialRows.length > 1 ? ` (and ${initialRows.length - 1} more row(s))` : "")
+      : "";
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(
+          pathSegments.length > 0
+            ? `Create Sheet "${name}" in ${pathSegments[pathSegments.length - 1]}`
+            : `Create Google Sheet: ${name}`,
+        ),
+        description:
+          `Create Google Sheet **${name}** inside ${pathLabel}.${rowDesc}\n\n` +
+          (pathSegments.length > 0
+            ? `Intermediate folder(s) (**${pathSegments.join(" → ")}**) will be created ` +
+              "if they do not already exist.\n\n"
+            : "") +
+          "If a Sheet with this name already exists in that folder, it will be reused.",
         implementsRevert: false,
       });
     } catch (error) {

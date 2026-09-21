@@ -28,33 +28,34 @@ export type DriveFolderInfo = {
  *
  * PURPOSE:
  *   Query the contents of a connected Google Drive folder and create new subfolders,
- *   Google Docs, and Google Sheets inside it. All folder operations are scoped to the
- *   bound folder — raw Drive IDs are never accepted from agent code.
+ *   Google Docs, and Google Sheets inside it — including inside nested subfolders —
+ *   all scoped to the bound folder. Raw Drive IDs are never accepted from agent code.
  *
  * IMPORTANT CONSTRAINTS:
  *   ✓ listFiles() and getFolder() are read-only observations (no approval needed).
- *   ✓ createFolder(), createDoc(), createSheet(), and scaffoldFolders() require user
- *     approval before executing.
+ *   ✓ createFolder(), createDoc(), createSheet(), scaffoldFolders(),
+ *     createDocAtPath(), and createSheetAtPath() require user approval before executing.
  *   ✓ All create/scaffold operations are idempotent: existing items with the same name
  *     are reused rather than duplicated. Safe to re-run on repeat calls.
  *   ✓ scaffoldFolders() creates nested subfolders under a relative path inside the bound
  *     folder — no new Drive binding is needed for each student/aluno.
+ *   ✓ createDocAtPath() and createSheetAtPath() create a Doc or Sheet inside a nested
+ *     subfolder path, also without requiring a new Drive binding per aluno.
  *   ✗ Does NOT delete or move existing files.
  *   ✗ Does NOT send email (use the Gmail binding for that).
- *   ✗ Does NOT expose raw Drive file/folder IDs for folder creation; use relative names.
- *   ✗ Does NOT support file uploads, sharing/permissions changes, search across Drive,
- *     export, or batch file operations — those remain outside this session's scope.
+ *   ✗ Does NOT expose raw Drive file/folder IDs for creation; use relative names/paths.
+ *   ✗ Does NOT support file uploads, sharing/permissions changes, Drive-wide search,
+ *     file export, or batch file operations — those remain outside this session's scope.
  *
  * WORKFLOW for creating items:
- *   1. Call createFolder() / createDoc() / createSheet() / scaffoldFolders() to queue
- *      the creation for approval.
+ *   1. Call any create/scaffold method to queue the creation for approval.
  *   2. User approves the action in the Workshop UI.
- *   3. Call listFiles() to see the newly created items.
+ *   3. Call listFiles() (on the target folder if needed) to verify the new items.
  *
  * NESTED FOLDER SCAFFOLDING (scaffoldFolders):
- *   One "Alunos" Drive binding can create per-student folders without needing a new
- *   binding per student. Example — create Documentos, Fotos, Relatorios Semanais
- *   inside each aluno's folder:
+ *   One "Alunos" Drive binding can scaffold per-student subfolders without a new binding
+ *   per student. Example — create Documentos, Fotos, Relatorios Semanais inside each
+ *   aluno's folder:
  *
  *     await drive.scaffoldFolders("Ana Silva", ["Documentos", "Fotos", "Relatorios Semanais"]);
  *     await drive.scaffoldFolders("Bruno Costa", ["Documentos", "Fotos", "Relatorios Semanais"]);
@@ -62,6 +63,26 @@ export type DriveFolderInfo = {
  *   Or with a deeper path (creates intermediate folders automatically):
  *
  *     await drive.scaffoldFolders(["Turma A", "Ana Silva"], ["Documentos", "Fotos"]);
+ *
+ * NESTED DOC / SHEET CREATION (createDocAtPath / createSheetAtPath):
+ *   After scaffolding folders you can place a Doc or Sheet inside any nested path without
+ *   a new Drive binding. Uses the same parentPath convention as scaffoldFolders.
+ *
+ *   Example — create a weekly-report Doc inside each aluno's Relatorios Semanais folder:
+ *
+ *     await drive.createDocAtPath(
+ *       ["Ana Silva", "Relatorios Semanais"],
+ *       "Semana 2026-09-21",
+ *       "Relatório semanal de Ana Silva\n\nAtividades:\n- ...",
+ *     );
+ *
+ *   Example — create a tracking Sheet inside a nested folder:
+ *
+ *     await drive.createSheetAtPath(
+ *       "Ana Silva",
+ *       "Frequencia",
+ *       [["Data", "Presente", "Observacoes"]],
+ *     );
  *
  * CONNECTING A SPECIFIC FOLDER:
  *   Connect with a folder URL such as https://drive.google.com/drive/folders/<folderId>.
@@ -86,24 +107,30 @@ export interface GoogleDriveFolderSession {
    * If a folder with the same name already exists, it will be reused after approval.
    * The action requires user approval before it is executed.
    * Call listFiles() after approval to see the new folder.
+   *
+   * To create a subfolder inside a nested path, use scaffoldFolders() instead.
    */
   createFolder(name: string): Promise<void>;
 
   /**
-   * Submit a request to create a Google Doc inside the connected folder.
+   * Submit a request to create a Google Doc directly inside the connected folder.
    * Optionally inserts `initialText` as the document's starting content.
    * If a Doc with the same name already exists, it will be reused after approval.
    * The action requires user approval before it is executed.
    * Call listFiles() after approval to see the new document.
+   *
+   * To create a Doc inside a nested subfolder, use createDocAtPath() instead.
    */
   createDoc(name: string, initialText?: string): Promise<void>;
 
   /**
-   * Submit a request to create a Google Sheet inside the connected folder.
+   * Submit a request to create a Google Sheet directly inside the connected folder.
    * Optionally appends `initialRows` as the spreadsheet's starting data.
    * If a Sheet with the same name already exists, it will be reused after approval.
    * The action requires user approval before it is executed.
    * Call listFiles() after approval to see the new spreadsheet.
+   *
+   * To create a Sheet inside a nested subfolder, use createSheetAtPath() instead.
    */
   createSheet(name: string, initialRows?: string[][]): Promise<void>;
 
@@ -136,4 +163,80 @@ export interface GoogleDriveFolderSession {
    *   await drive.scaffoldFolders([], ["Documentos", "Fotos"]);
    */
   scaffoldFolders(parentPath: string | string[], folderNames: string[]): Promise<void>;
+
+  /**
+   * Submit a request to create a Google Doc under a relative path inside the bound folder.
+   * All path resolution starts from the bound folder — no raw Drive IDs.
+   * Intermediate folders in `parentPath` are created idempotently if absent.
+   *
+   * @param parentPath  A single folder name (string) or an ordered list of names (string[])
+   *                    forming a relative path under the bound folder. Each intermediate
+   *                    folder is created if it does not exist. Pass [] or "" to create
+   *                    directly inside the bound folder (same as createDoc()).
+   * @param name        Name for the new Google Doc. Must follow the segment rules below.
+   * @param initialText Optional text to insert as the document's starting content.
+   *
+   * Segment rules (applied to every path segment and the doc name):
+   *   - Must be non-empty and at most 255 characters.
+   *   - Must not contain `/`, `\`, null bytes, or control characters (ASCII 0–31).
+   *   - At most 10 path segments.
+   *
+   * Idempotent: if a Doc with the same name already exists under the resolved path, it is
+   * reused rather than duplicated.
+   * Requires user approval before the Doc is created.
+   *
+   * Examples:
+   *   // Create a weekly-report Doc inside Ana Silva's Relatorios Semanais folder
+   *   await drive.createDocAtPath(
+   *     ["Ana Silva", "Relatorios Semanais"],
+   *     "Semana 2026-09-21",
+   *     "Relatório semanal de Ana Silva\n\nAtividades:\n- ...",
+   *   );
+   *
+   *   // Create directly inside the bound folder (equivalent to createDoc)
+   *   await drive.createDocAtPath([], "Ata de Reuniao");
+   */
+  createDocAtPath(
+    parentPath: string | string[],
+    name: string,
+    initialText?: string,
+  ): Promise<void>;
+
+  /**
+   * Submit a request to create a Google Sheet under a relative path inside the bound folder.
+   * All path resolution starts from the bound folder — no raw Drive IDs.
+   * Intermediate folders in `parentPath` are created idempotently if absent.
+   *
+   * @param parentPath  A single folder name (string) or an ordered list of names (string[])
+   *                    forming a relative path under the bound folder. Each intermediate
+   *                    folder is created if it does not exist. Pass [] or "" to create
+   *                    directly inside the bound folder (same as createSheet()).
+   * @param name        Name for the new Google Sheet. Must follow the segment rules below.
+   * @param initialRows Optional 2-D array of strings to write as the sheet's starting rows.
+   *
+   * Segment rules (applied to every path segment and the sheet name):
+   *   - Must be non-empty and at most 255 characters.
+   *   - Must not contain `/`, `\`, null bytes, or control characters (ASCII 0–31).
+   *   - At most 10 path segments.
+   *
+   * Idempotent: if a Sheet with the same name already exists under the resolved path, it is
+   * reused rather than duplicated.
+   * Requires user approval before the Sheet is created.
+   *
+   * Examples:
+   *   // Create a frequency-tracking Sheet inside Ana Silva's folder
+   *   await drive.createSheetAtPath(
+   *     "Ana Silva",
+   *     "Frequencia",
+   *     [["Data", "Presente", "Observacoes"]],
+   *   );
+   *
+   *   // Create directly inside the bound folder (equivalent to createSheet)
+   *   await drive.createSheetAtPath([], "Dados Gerais");
+   */
+  createSheetAtPath(
+    parentPath: string | string[],
+    name: string,
+    initialRows?: string[][],
+  ): Promise<void>;
 }

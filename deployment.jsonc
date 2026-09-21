@@ -1,7 +1,7 @@
 {
   // Cloudflare account that owns every Worker and provisioned resource.
   // Find it: https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/
-  "accountId": "<CLOUDFLARE_ACCOUNT_ID>",
+  "accountId": "5f87487935ef00f3d43fe0439aaa185a",
 
   // The deployment's public origin, used for PUBLIC_BASE_URL and to scope Context data.
   // null derives it from workers.router.route.customDomain.
@@ -16,24 +16,38 @@
     // Owns the public URL and serves the frontend. Proxies /api and /blueprint-screenshot to the
     // Workshop, and /gatekeeper/<name> to the matching Gatekeeper.
     "router": {
-      "name": "<ROUTER_WORKER_NAME>",
+      "name": "foundation-os-router",
 
       // Production: use a hostname in an active Cloudflare zone. Wrangler creates DNS and TLS.
       // Evaluation: replace this with "route": { "workersDev": true } and set publicBaseUrl above.
       // https://developers.cloudflare.com/workers/configuration/routing/custom-domains/
-      "route": { "customDomain": "os.example.com" }
+      "route": { "customDomain": "os.psychohistory.rodrigonobre.eu" }
     },
 
     // The Workshop backend. No public route: the router reaches it over a service binding.
-    "workshop": { "name": "<WORKSHOP_WORKER_NAME>" },
-    "context": { "name": "<CONTEXT_WORKER_NAME>" },
+    "workshop": { "name": "foundation-os-workshop" },
+    "context": { "name": "foundation-os-context" },
 
     // The Scheduler Gatekeeper, which gives agents scheduled and recurring work. Ambient like
     // the Context Gatekeeper
-    "scheduler": { "name": "<SCHEDULER_WORKER_NAME>" },
+    "scheduler": { "name": "foundation-os-scheduler" },
 
-    "customGatekeeper": { "name": "<CUSTOM_GATEKEEPER_WORKER_NAME>" },
-    "errorReporter": { "name": "<ERROR_REPORTER_WORKER_NAME>" }
+    "customGatekeeper": { "name": "foundation-os-custom-gatekeeper" },
+    "errorReporter": { "name": "foundation-os-error-reporter" },
+
+    // The Google Gatekeeper (Gmail, Docs, Sheets, Calendar, BigQuery). Optional: remove this entry
+    // to exclude Google entirely. CLIENT_ID and CLIENT_SECRET are not here; add them after the
+    // first deploy with: CLOUDFLARE_ACCOUNT_ID=<id> wrangler secret put CLIENT_ID --name foundation-os-google
+    "google": { "name": "foundation-os-google" },
+
+    // The MCP Server Portal Gatekeeper. Optional: remove this entry to exclude it entirely.
+    // Configure the portal endpoint in mcpPortal.url below after creating an MCP portal in Zero Trust.
+    "mcpPortal": { "name": "foundation-os-mcp-portal" },
+
+    // The Home Assistant Gatekeeper. Optional: remove this entry to exclude it entirely.
+    // No deploy-time secrets needed — the HA instance URL and long-lived access token are
+    // supplied by the user at connect time through the Workshop UI.
+    "homeassistant": { "name": "foundation-os-homeassistant" }
   },
 
   // This starter deploys Cloudflare Access mode. Cloudflare OS also supports built-in password
@@ -42,9 +56,9 @@
   // "admins" gates /admin in every sign-in method.
   // Reference: docs/customization.md#sign-in-methods
   "access": {
-    "issuer": "https://<TEAM_NAME>.cloudflareaccess.com",
-    "audience": "<ACCESS_AUDIENCE>",
-    "admins": ["<ADMIN_EMAIL>"]
+    "issuer": "https://cf-rnobre.cloudflareaccess.com",
+    "audience": "e8f411c279417c8d6a2d79e43283ce29a061e13868ff47f746473db619801d9a",
+    "admins": ["rodrigo.gil.nobre@gmail.com"]
   },
 
   // Model catalog served through Cloudflare AI Gateway. Enabled by default: the Workshop reaches
@@ -89,8 +103,19 @@
   // Displayed to agents when the example custom integration is enabled in /admin.
   // Reference: docs/customization.md#custom-gatekeepers
   "customGatekeeper": {
-    "name": "<ORGANIZATION_DISPLAY_NAME>",
-    "message": "<ORGANIZATION_GUIDANCE>"
+    "name": "Foundation",
+    "message": "Foundation is a personal homelab and household AI front door. Start read-only, explain actions clearly, and require explicit human approval before any side effect."
+  },
+
+  // Cloudflare Zero Trust MCP Server Portal endpoint. Create a portal at:
+  // Zero Trust > Access controls > MCP Portals, add the upstream MCP servers you want, then set this
+  // to the portal's Streamable HTTP endpoint, usually https://<portal-host>/mcp.
+  // null deploys the Worker but hides the connector until a real endpoint is configured.
+  "mcpPortal": {
+    "url": "https://mcp.psychohistory.rodrigonobre.eu/mcp",
+    "name": "Foundation MCP Portal",
+    "auth": "oauth",
+    "trustAnnotations": false
   },
 
   // Explicit backend issue reports go to a private Worker that emits structured console errors.

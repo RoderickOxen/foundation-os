@@ -33,6 +33,7 @@ The custom logo appears in the app chrome, sign-in screens, and browser tab on e
 | `aiGateway` | Deployment-managed model catalog | Enabled by default over the Workers AI binding; which providers to advertise, and which gateway |
 | `context` | Context sharing boundary, snapshot KV, and optional Artifacts repositories | `null` to scope data to the public origin, or a pinned stable label; automatic or existing KV; Git-backed collections disabled or enabled |
 | `customGatekeeper` | Example integration identity and guidance | Organization-specific display text |
+| `mcpPortal` | Deployment-owned MCP Server Portal connector | Portal `/mcp` endpoint, display name, auth mode, and trust-annotations policy |
 | `errorReporting` | Private explicit-issue destination | Console Reporter enabled state, environment, and release metadata |
 | `resources` | Blueprint/avatar KV and blueprint-content R2 | `null` to provision or explicit IDs/names to reuse |
 | `observability` | Worker telemetry | Structured logs, invocation logs, traces, and sampling; see the [observability guide](observability.md) |
@@ -41,7 +42,7 @@ Secrets are never valid values in this file. Install them interactively with Wra
 
 ### Workers and routing
 
-The deployment is six Workers. Keep their names unique: service bindings use these names, so update and deploy them together.
+The deployment is a small set of Workers. Keep their names unique: service bindings use these names, so update and deploy them together.
 
 | Worker | Role |
 | --- | --- |
@@ -50,11 +51,14 @@ The deployment is six Workers. Keep their names unique: service bindings use the
 | `context` | The Context Gatekeeper. |
 | `scheduler` | The Scheduler Gatekeeper, which gives agents scheduled and recurring work. |
 | `customGatekeeper` | This repository's example integration. |
+| `google` | Optional Google Gatekeeper. |
+| `mcpPortal` | Optional MCP Server Portal Gatekeeper. It is hidden until `mcpPortal.url` names a real portal endpoint. |
+| `homeassistant` | Optional Home Assistant Gatekeeper. |
 | `errorReporter` | The private explicit-issue destination. |
 
 Context and Scheduler are *ambient*: upstream's release marks both `PREINSTALL`, so the hosted flow installs them on every instance and this starter deploys them for the same reason. Neither takes configuration beyond its name — the Scheduler takes none at all.
 
-Only the router takes a route; the other five are reachable only over service bindings, and the deploy turns off `workers.dev` and [Preview URLs](https://developers.cloudflare.com/workers/configuration/previews/) on all six. That keeps the router the single Access-protected way in.
+Only the router takes a route; the other Workers are reachable only over service bindings, and the deploy turns off `workers.dev` and [Preview URLs](https://developers.cloudflare.com/workers/configuration/previews/) on them. That keeps the router the single Access-protected way in.
 
 For production, set a [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/) on it:
 
@@ -121,6 +125,18 @@ Wrangler creates resources with the Worker name as a prefix and reconnects them 
 
 ```jsonc
 "context": { "sharingDomain": "https://os.example.com" }
+```
+
+### MCP Server Portal
+
+To expose a deployment-owned MCP Server Portal in the Workshop, keep `workers.mcpPortal` configured and set `mcpPortal.url` to the portal's Streamable HTTP endpoint, usually `https://<portal-host>/mcp`.
+
+Create the portal in **Zero Trust** > **Access controls** > **MCP Portals**, add the upstream MCP servers you want, and add Access policies for users who may connect. Until `mcpPortal.url` is non-null, the Worker can deploy but the connector advertises no resources and stays hidden.
+
+`mcpPortal.auth` defaults to OAuth. If you set it to `token`, install the token as a secret on the MCP Portal Worker:
+
+```sh
+CLOUDFLARE_ACCOUNT_ID=<account-id> pnpm exec wrangler secret put MCP_PORTAL_TOKEN --name <mcp-portal-worker-name>
 ```
 
 ### Context Artifacts

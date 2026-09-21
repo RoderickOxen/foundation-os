@@ -20,6 +20,9 @@ const validConfig: DeploymentConfig = {
     scheduler: { name: "acme-cloudflare-os-scheduler" },
     customGatekeeper: { name: "acme-cloudflare-os-custom" },
     errorReporter: { name: "acme-cloudflare-os-errors" },
+    google: { name: "acme-cloudflare-os-google" },
+    mcpPortal: { name: "acme-cloudflare-os-mcp-portal" },
+    homeassistant: { name: "acme-cloudflare-os-homeassistant" },
   },
   access: {
     issuer: "https://acme.cloudflareaccess.com",
@@ -38,6 +41,12 @@ const validConfig: DeploymentConfig = {
     artifacts: { enabled: true, namespace: "acme-context-collections" },
   },
   customGatekeeper: { name: "Acme", message: "Use the company handbook." },
+  mcpPortal: {
+    url: "https://mcp.example.com/mcp",
+    name: "Acme MCP Portal",
+    auth: "oauth",
+    trustAnnotations: false,
+  },
   errorReporting: { enabled: true, environment: "production", release: "abc123" },
   resources: {
     blueprintsKvNamespaceId: "blueprints-kv-id",
@@ -75,6 +84,9 @@ async function baseConfigs(): Promise<BaseConfigs> {
     scheduler: await baseConfig("../cloudflare-os/packages/gatekeeper-scheduler/wrangler.jsonc"),
     customGatekeeper: await baseConfig("../packages/custom-gatekeeper/wrangler.jsonc"),
     errorReporter: await baseConfig("../packages/error-reporter/wrangler.jsonc"),
+    google: await baseConfig("../cloudflare-os/packages/gatekeeper-google/wrangler.jsonc"),
+    mcpPortal: await baseConfig("../cloudflare-os/packages/gatekeeper-mcp-portal/wrangler.jsonc"),
+    homeassistant: await baseConfig("../cloudflare-os/packages/gatekeeper-homeassistant/wrangler.jsonc"),
   };
 }
 
@@ -225,6 +237,21 @@ test("generates Access-mode Workshop, Context, and custom Gatekeeper configs", a
       service: "acme-cloudflare-os-custom",
       entrypoint: "GatekeeperVendor",
     },
+    {
+      binding: "GATEKEEPER_GOOGLE",
+      service: "acme-cloudflare-os-google",
+      entrypoint: "GatekeeperVendor",
+    },
+    {
+      binding: "GATEKEEPER_MCP_PORTAL",
+      service: "acme-cloudflare-os-mcp-portal",
+      entrypoint: "GatekeeperVendor",
+    },
+    {
+      binding: "GATEKEEPER_HOMEASSISTANT",
+      service: "acme-cloudflare-os-homeassistant",
+      entrypoint: "GatekeeperVendor",
+    },
   ]);
   assert.deepEqual(generated.workshop.kv_namespaces, [
     { binding: "BLUEPRINTS", id: "blueprints-kv-id" },
@@ -268,6 +295,9 @@ test("gives the router the public route, the frontend, and every service binding
     { binding: "GATEKEEPER_CONTEXT", service: "acme-cloudflare-os-context" },
     { binding: "GATEKEEPER_SCHEDULER", service: "acme-cloudflare-os-scheduler" },
     { binding: "GATEKEEPER_CUSTOM", service: "acme-cloudflare-os-custom" },
+    { binding: "GATEKEEPER_GOOGLE", service: "acme-cloudflare-os-google" },
+    { binding: "GATEKEEPER_MCP_PORTAL", service: "acme-cloudflare-os-mcp-portal" },
+    { binding: "GATEKEEPER_HOMEASSISTANT", service: "acme-cloudflare-os-homeassistant" },
   ]);
   // Inherited untouched: the base config already carries the ASSETS binding, the SPA fallback, and
   // the /gatekeeper/* prefix an OAuth Gatekeeper redirect needs.
@@ -315,6 +345,162 @@ test("deploys the ambient Scheduler Gatekeeper the hosted flow preinstalls", asy
     .map(({ args }) => args)
     .filter((args) => args.includes("@gadgets/gatekeeper-scheduler"));
   assert.deepEqual(builds.map((args) => args.at(-1)), ["build:app", "build"]);
+});
+
+test("deploys the Google Gatekeeper with BASE_URL and service bindings", async () => {
+  const bases = await baseConfigs();
+  const generated = generateConfigs(validConfig, bases);
+
+  assert.equal(generated.google!.name, "acme-cloudflare-os-google");
+  // BASE_URL scopes the OAuth handler's redirect URI and the GatekeeperVendor's URL root.
+  // CLIENT_ID and CLIENT_SECRET are intentionally absent: they are secrets that the operator
+  // installs with `wrangler secret put` after the Worker exists.
+  assert.deepEqual(generated.google!.vars, {
+    BASE_URL: "https://os.example.com/gatekeeper/google",
+  });
+  assert.equal(generated.google!.secrets, undefined);
+  // Workshop vendor-RPC binding (GatekeeperVendor entrypoint, like every other gatekeeper).
+  assert.deepEqual(
+    generated.workshop.services!.find((service) => service.binding === "GATEKEEPER_GOOGLE"),
+    { binding: "GATEKEEPER_GOOGLE", service: "acme-cloudflare-os-google", entrypoint: "GatekeeperVendor" });
+  // Router binding (no entrypoint: whole HTTP requests for /gatekeeper/google/*).
+  assert.deepEqual(
+    generated.router.services!.find((service) => service.binding === "GATEKEEPER_GOOGLE"),
+    { binding: "GATEKEEPER_GOOGLE", service: "acme-cloudflare-os-google" });
+  // Durable Object migrations must arrive verbatim.
+  assert.deepEqual(generated.google!.migrations, bases.google.migrations);
+  assert.ok((generated.google!.migrations?.length ?? 0) > 0, "google lost its DO migrations");
+
+  // The Drive Setup BASE_URL must point to /gatekeeper/google (same worker, same origin).
+  // This confirms the path prefix the gatekeeper fetch handler validates for OAuth callbacks,
+  // and that the narrowed Drive URL routing (only /drive/my-drive, not /drive/*) still has
+  // a correctly scoped home at the Google worker's BASE_URL.
+  assert.ok(
+    generated.google!.vars!.BASE_URL.endsWith("/gatekeeper/google"),
+    "google BASE_URL must end with /gatekeeper/google so Drive Setup fetch handler validates paths");
+
+  // Build commands include google's configurator HTML step.
+  const googleBuilds = buildCommands(validConfig)
+    .map(({ args }) => args)
+    .filter((args) => args.includes("@gadgets/google-gatekeeper"));
+  assert.deepEqual(googleBuilds.map((args) => args.at(-1)), ["build:configurator"]);
+
+  // Without google configured, no bindings or builds are emitted.
+  const withoutGoogle = variant((c) => { delete c.workers.google; });
+  const generatedWithout = generateConfigs(withoutGoogle, bases);
+  assert.equal(generatedWithout.google, undefined);
+  assert.equal(
+    generatedWithout.workshop.services!.some((s) => s.binding === "GATEKEEPER_GOOGLE"), false);
+  assert.equal(
+    generatedWithout.router.services!.some((s) => s.binding === "GATEKEEPER_GOOGLE"), false);
+  assert.equal(
+    buildCommands(withoutGoogle).some(({ args }) => args.includes("@gadgets/google-gatekeeper")),
+    false);
+});
+
+test("deploys the MCP Portal Gatekeeper with portal config and service bindings", async () => {
+  const bases = await baseConfigs();
+  const generated = generateConfigs(validConfig, bases);
+
+  assert.equal(generated.mcpPortal!.name, "acme-cloudflare-os-mcp-portal");
+  assert.deepEqual(generated.mcpPortal!.vars, {
+    MCP_ALLOW_INSECURE: "false",
+    BASE_URL: "https://os.example.com/gatekeeper/mcp-portal",
+    MCP_PORTAL_URL: "https://mcp.example.com/mcp",
+    MCP_PORTAL_NAME: "Acme MCP Portal",
+    MCP_PORTAL_AUTH: "oauth",
+  });
+  assert.equal(generated.mcpPortal!.secrets, undefined);
+  assert.deepEqual(
+    generated.workshop.services!.find((s) => s.binding === "GATEKEEPER_MCP_PORTAL"),
+    { binding: "GATEKEEPER_MCP_PORTAL", service: "acme-cloudflare-os-mcp-portal",
+      entrypoint: "GatekeeperVendor" });
+  assert.deepEqual(
+    generated.router.services!.find((s) => s.binding === "GATEKEEPER_MCP_PORTAL"),
+    { binding: "GATEKEEPER_MCP_PORTAL", service: "acme-cloudflare-os-mcp-portal" });
+  assert.deepEqual(generated.mcpPortal!.migrations, bases.mcpPortal.migrations);
+  assert.ok((generated.mcpPortal!.migrations?.length ?? 0) > 0,
+    "mcpPortal lost its DO migrations");
+
+  const mcpPortalBuildArgs = buildCommands(validConfig)
+    .map(({ args }) => args)
+    .filter((args) => args.includes("@gadgets/mcp-portal-gatekeeper"));
+  assert.deepEqual(mcpPortalBuildArgs.map((args) => args.at(-1)), ["build:configurator"]);
+
+  const tokenAuth = variant((c) => { c.mcpPortal.auth = "token"; });
+  assert.deepEqual(generateConfigs(tokenAuth, bases).mcpPortal!.secrets,
+    { required: ["MCP_PORTAL_TOKEN"] });
+
+  const hidden = variant((c) => { c.mcpPortal.url = null; delete c.mcpPortal.name; });
+  const hiddenGenerated = generateConfigs(hidden, bases);
+  assert.deepEqual(hiddenGenerated.mcpPortal!.vars, {
+    MCP_ALLOW_INSECURE: "false",
+    BASE_URL: "https://os.example.com/gatekeeper/mcp-portal",
+    MCP_PORTAL_AUTH: "oauth",
+  });
+
+  const withoutMcpPortal = variant((c) => {
+    delete c.workers.mcpPortal;
+    delete c.mcpPortal;
+  });
+  const generatedWithout = generateConfigs(withoutMcpPortal, bases);
+  assert.equal(generatedWithout.mcpPortal, undefined);
+  assert.equal(
+    generatedWithout.workshop.services!.some((s) => s.binding === "GATEKEEPER_MCP_PORTAL"),
+    false);
+  assert.equal(
+    generatedWithout.router.services!.some((s) => s.binding === "GATEKEEPER_MCP_PORTAL"),
+    false);
+  assert.equal(
+    buildCommands(withoutMcpPortal).some(({ args }) =>
+      args.includes("@gadgets/mcp-portal-gatekeeper")),
+    false);
+});
+
+test("deploys the Home Assistant Gatekeeper with BASE_URL and service bindings", async () => {
+  const bases = await baseConfigs();
+  const generated = generateConfigs(validConfig, bases);
+
+  assert.equal(generated.homeassistant!.name, "acme-cloudflare-os-homeassistant");
+  // BASE_URL scopes the gatekeeper to its path prefix. No deploy-time secrets: the HA instance
+  // URL and long-lived access token are provided by the user at connection time.
+  assert.deepEqual(generated.homeassistant!.vars, {
+    BASE_URL: "https://os.example.com/gatekeeper/homeassistant",
+  });
+  assert.equal(generated.homeassistant!.secrets, undefined);
+  // Workshop vendor-RPC binding (GatekeeperVendor entrypoint, matching every other gatekeeper).
+  assert.deepEqual(
+    generated.workshop.services!.find((s) => s.binding === "GATEKEEPER_HOMEASSISTANT"),
+    { binding: "GATEKEEPER_HOMEASSISTANT", service: "acme-cloudflare-os-homeassistant",
+      entrypoint: "GatekeeperVendor" });
+  // Router binding (no entrypoint: whole HTTP requests for /gatekeeper/homeassistant/*).
+  assert.deepEqual(
+    generated.router.services!.find((s) => s.binding === "GATEKEEPER_HOMEASSISTANT"),
+    { binding: "GATEKEEPER_HOMEASSISTANT", service: "acme-cloudflare-os-homeassistant" });
+  // Durable Object migrations must arrive verbatim.
+  assert.deepEqual(generated.homeassistant!.migrations, bases.homeassistant.migrations);
+  assert.ok((generated.homeassistant!.migrations?.length ?? 0) > 0,
+    "homeassistant lost its DO migrations");
+
+  // Build commands include the HA configurator step.
+  const haBuildArgs = buildCommands(validConfig)
+    .map(({ args }) => args)
+    .filter((args) => args.includes("@gadgets/homeassistant-gatekeeper"));
+  assert.deepEqual(haBuildArgs.map((args) => args.at(-1)), ["build:configurator"]);
+
+  // Without homeassistant configured, no bindings or builds are emitted.
+  const withoutHA = variant((c) => { delete c.workers.homeassistant; });
+  const generatedWithout = generateConfigs(withoutHA, bases);
+  assert.equal(generatedWithout.homeassistant, undefined);
+  assert.equal(
+    generatedWithout.workshop.services!.some((s) => s.binding === "GATEKEEPER_HOMEASSISTANT"),
+    false);
+  assert.equal(
+    generatedWithout.router.services!.some((s) => s.binding === "GATEKEEPER_HOMEASSISTANT"),
+    false);
+  assert.equal(
+    buildCommands(withoutHA).some(({ args }) => args.includes("@gadgets/homeassistant-gatekeeper")),
+    false);
 });
 
 test("keeps every Worker behind the router off the public internet", async () => {

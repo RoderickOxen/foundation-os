@@ -26,6 +26,9 @@ const packageDirs = {
   scheduler: "cloudflare-os/packages/gatekeeper-scheduler",
   customGatekeeper: "packages/custom-gatekeeper",
   errorReporter: "packages/error-reporter",
+  google: "cloudflare-os/packages/gatekeeper-google",
+  mcpPortal: "cloudflare-os/packages/gatekeeper-mcp-portal",
+  homeassistant: "cloudflare-os/packages/gatekeeper-homeassistant",
 } as const;
 const generatedPaths = Object.fromEntries(
   Object.entries(packageDirs).map(([name, dir]) => [name, join(root, dir, generatedName)]),
@@ -240,6 +243,8 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
 
   validatePublicBaseUrl(config, route);
 
+  validateMcpPortal(config);
+
   const sharingDomain = config.context.sharingDomain;
   if (sharingDomain !== null &&
       (typeof sharingDomain !== "string" || !sharingDomain.trim())) {
@@ -391,6 +396,42 @@ function validateAiGateway(config: DeploymentConfig): void {
   }
 }
 
+function validateMcpPortal(config: DeploymentConfig): void {
+  if (!config.workers.mcpPortal && config.mcpPortal !== undefined) {
+    throw new Error("mcpPortal configuration requires workers.mcpPortal.");
+  }
+  const portal = config.mcpPortal;
+  if (portal === undefined) return;
+  if (portal === null || typeof portal !== "object" || Array.isArray(portal)) {
+    throw new Error("mcpPortal configuration must be an object when present.");
+  }
+  if (portal.url !== null) {
+    if (typeof portal.url !== "string" || !portal.url.trim()) {
+      throw new Error("mcpPortal.url must be null or a non-empty HTTPS URL.");
+    }
+    let url: URL;
+    try {
+      url = new URL(portal.url);
+    } catch {
+      throw new Error("mcpPortal.url must be null or a valid HTTPS URL.");
+    }
+    if (url.protocol !== "https:" || url.username || url.password || url.hash) {
+      throw new Error(
+        "mcpPortal.url must be an HTTPS URL with no username, password, or fragment.");
+    }
+  }
+  if (portal.name !== undefined &&
+      (typeof portal.name !== "string" || !portal.name.trim() || portal.name !== portal.name.trim())) {
+    throw new Error("mcpPortal.name must be omitted or a non-padded string.");
+  }
+  if (portal.auth !== undefined && !["oauth", "none", "token"].includes(portal.auth)) {
+    throw new Error("mcpPortal.auth must be omitted, oauth, none, or token.");
+  }
+  if (portal.trustAnnotations !== undefined && typeof portal.trustAnnotations !== "boolean") {
+    throw new Error("mcpPortal.trustAnnotations must be a boolean when present.");
+  }
+}
+
 function routeConfig(route: RouterRoute) {
   return route.workersDev
     ? { workers_dev: true, routes: undefined }
@@ -438,6 +479,11 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   const errorReporter = config.errorReporting.enabled
     ? structuredClone(bases.errorReporter)
     : undefined;
+  const google = config.workers.google ? structuredClone(bases.google) : undefined;
+  const mcpPortal = config.workers.mcpPortal ? structuredClone(bases.mcpPortal) : undefined;
+  const homeassistant = config.workers.homeassistant
+    ? structuredClone(bases.homeassistant)
+    : undefined;
   const origin = publicOrigin(config);
 
   setCommon(router, config, config.workers.router.name, config.workers.router.route);
@@ -448,6 +494,15 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     { binding: "GATEKEEPER_CONTEXT", service: config.workers.context.name },
     { binding: "GATEKEEPER_SCHEDULER", service: config.workers.scheduler.name },
     { binding: "GATEKEEPER_CUSTOM", service: config.workers.customGatekeeper.name },
+    ...(config.workers.google
+      ? [{ binding: "GATEKEEPER_GOOGLE", service: config.workers.google.name }]
+      : []),
+    ...(config.workers.mcpPortal
+      ? [{ binding: "GATEKEEPER_MCP_PORTAL", service: config.workers.mcpPortal.name }]
+      : []),
+    ...(config.workers.homeassistant
+      ? [{ binding: "GATEKEEPER_HOMEASSISTANT", service: config.workers.homeassistant.name }]
+      : []),
   ];
 
   setCommon(workshop, config, config.workers.workshop.name);
@@ -513,6 +568,21 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
       service: config.workers.customGatekeeper.name,
       entrypoint: "GatekeeperVendor",
     },
+    ...(config.workers.google ? [{
+      binding: "GATEKEEPER_GOOGLE",
+      service: config.workers.google.name,
+      entrypoint: "GatekeeperVendor",
+    }] : []),
+    ...(config.workers.mcpPortal ? [{
+      binding: "GATEKEEPER_MCP_PORTAL",
+      service: config.workers.mcpPortal.name,
+      entrypoint: "GatekeeperVendor",
+    }] : []),
+    ...(config.workers.homeassistant ? [{
+      binding: "GATEKEEPER_HOMEASSISTANT",
+      service: config.workers.homeassistant.name,
+      entrypoint: "GatekeeperVendor",
+    }] : []),
   ];
   workshop.kv_namespaces = [
     { binding: "BLUEPRINTS", ...(config.resources.blueprintsKvNamespaceId
@@ -552,6 +622,47 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
     CUSTOM_MESSAGE: config.customGatekeeper.message,
   };
 
+  if (google && config.workers.google) {
+    setCommon(google, config, config.workers.google.name);
+    // BASE_URL tells the OAuth handler the redirect base and the GatekeeperVendor the URL root it
+    // is served under. CLIENT_ID and CLIENT_SECRET are not written here: they are secrets added
+    // with `wrangler secret put` after the Worker is first deployed.
+    google.vars = {
+      BASE_URL: `${origin}/gatekeeper/google`,
+    };
+  }
+
+  if (mcpPortal && config.workers.mcpPortal) {
+    setCommon(mcpPortal, config, config.workers.mcpPortal.name);
+    const portal = config.mcpPortal;
+    mcpPortal.vars = {
+      ...mcpPortal.vars,
+      BASE_URL: `${origin}/gatekeeper/mcp-portal`,
+      ...(portal?.url ? { MCP_PORTAL_URL: portal.url } : {}),
+      ...(portal?.name ? { MCP_PORTAL_NAME: portal.name } : {}),
+      ...(portal?.auth ? { MCP_PORTAL_AUTH: portal.auth } : {}),
+      ...(portal?.trustAnnotations ? { MCP_PORTAL_TRUST_ANNOTATIONS: "true" } : {}),
+    };
+    if (portal?.auth === "token") {
+      mcpPortal.secrets = {
+        required: [...new Set([
+          ...(mcpPortal.secrets?.required ?? []),
+          "MCP_PORTAL_TOKEN",
+        ])],
+      };
+    }
+  }
+
+  if (homeassistant && config.workers.homeassistant) {
+    setCommon(homeassistant, config, config.workers.homeassistant.name);
+    // BASE_URL tells the gatekeeper which path prefix it is mounted under. The HA instance URL
+    // and long-lived access token are supplied by the user at connect time (not at deploy time),
+    // so no secrets are written here.
+    homeassistant.vars = {
+      BASE_URL: `${origin}/gatekeeper/homeassistant`,
+    };
+  }
+
   if (errorReporter) {
     setCommon(errorReporter, config, config.workers.errorReporter!.name);
   }
@@ -559,6 +670,9 @@ export function generateConfigs(config: DeploymentConfig, bases: BaseConfigs): G
   return {
     router, workshop, context, scheduler, customGatekeeper,
     ...(errorReporter && { errorReporter }),
+    ...(google && { google }),
+    ...(mcpPortal && { mcpPortal }),
+    ...(homeassistant && { homeassistant }),
   };
 }
 
@@ -604,6 +718,20 @@ export function buildCommands(config: DeploymentConfig): BuildCommand[] {
     // The Scheduler's `build` nests the same cached `vp run build:app`, so it needs the same pair.
     { args: submoduleBuild("@gadgets/gatekeeper-scheduler", "build:app") },
     { args: submoduleBuild("@gadgets/gatekeeper-scheduler") },
+    // Google's deploy script runs `build:configurator` (a vite+ task, no nesting issue) and lets
+    // wrangler invoke capnweb-validate for the worker bundle itself. Run it unconditionally before
+    // the wrangler deploy step so the configurator HTML is always freshly generated.
+    ...(config.workers.google ? [
+      { args: submoduleBuild("@gadgets/google-gatekeeper", "build:configurator") },
+    ] : []),
+    ...(config.workers.mcpPortal ? [
+      { args: submoduleBuild("@gadgets/mcp-portal-gatekeeper", "build:configurator") },
+    ] : []),
+    // Home Assistant follows the same pattern as Google: build:configurator generates the
+    // configurator HTML; capnweb-validate runs internally via wrangler during deploy.
+    ...(config.workers.homeassistant ? [
+      { args: submoduleBuild("@gadgets/homeassistant-gatekeeper", "build:configurator") },
+    ] : []),
     { args: ownBuild("custom-gatekeeper") },
     ...(config.errorReporting.enabled ? [{ args: ownBuild("error-reporter") }] : []),
     // Access mode is a build-time constant in the frontend bundle (`src/useAuth.ts`), so it is set
@@ -721,6 +849,9 @@ async function main(): Promise<void> {
     scheduler: await readJsonc(join(root, packageDirs.scheduler, "wrangler.jsonc")),
     customGatekeeper: await readJsonc(join(root, packageDirs.customGatekeeper, "wrangler.jsonc")),
     errorReporter: await readJsonc(join(root, packageDirs.errorReporter, "wrangler.jsonc")),
+    google: await readJsonc(join(root, packageDirs.google, "wrangler.jsonc")),
+    mcpPortal: await readJsonc(join(root, packageDirs.mcpPortal, "wrangler.jsonc")),
+    homeassistant: await readJsonc(join(root, packageDirs.homeassistant, "wrangler.jsonc")),
   });
   reportAiGateway(config);
 
@@ -740,6 +871,15 @@ async function main(): Promise<void> {
     deployWorker(packageDirs.context, deployArgs);
     deployWorker(packageDirs.scheduler, deployArgs);
     deployWorker(packageDirs.customGatekeeper, deployArgs);
+    if (config.workers.google) {
+      deployWorker(packageDirs.google, deployArgs);
+    }
+    if (config.workers.mcpPortal) {
+      deployWorker(packageDirs.mcpPortal, deployArgs);
+    }
+    if (config.workers.homeassistant) {
+      deployWorker(packageDirs.homeassistant, deployArgs);
+    }
     deployWorker(packageDirs.workshop, deployArgs);
     // Last: it binds every one of the above.
     deployWorker(packageDirs.router, deployArgs);

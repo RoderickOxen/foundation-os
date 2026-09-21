@@ -80,6 +80,18 @@ export interface ContextConfig {
   artifacts?: { enabled?: boolean; namespace?: string };
 }
 
+/** Deployment-owned MCP Server Portal connector configuration. */
+export interface McpPortalConfig {
+  /** Streamable HTTP endpoint for the portal, usually ending in `/mcp`. `null` hides the connector. */
+  url: string | null;
+  /** Display name for the connector. Omitted uses the gatekeeper default. */
+  name?: string;
+  /** Portal auth mode. Defaults to OAuth. */
+  auth?: "oauth" | "none" | "token";
+  /** Whether upstream tool annotations may drive auto-approval. Defaults to false. */
+  trustAnnotations?: boolean;
+}
+
 /** Worker telemetry. Maps onto wrangler's `observability` block. */
 export interface DeploymentObservabilityConfig {
   enabled: boolean;
@@ -114,12 +126,20 @@ export interface DeploymentConfig {
     customGatekeeper: { name: string };
     /** Only required when `errorReporting.enabled`. */
     errorReporter?: { name: string };
+    /** Optional Google Gatekeeper (Gmail, Docs, Sheets, Calendar, BigQuery). */
+    google?: { name: string };
+    /** Optional MCP Server Portal Gatekeeper. Portal endpoint is configured by `mcpPortal`. */
+    mcpPortal?: { name: string };
+    /** Optional Home Assistant Gatekeeper. Connection credentials are supplied at connect time. */
+    homeassistant?: { name: string };
   };
   access: AccessConfig;
   aiGateway: AiGatewayConfigInput;
   context: ContextConfig;
   /** Display text the example custom Gatekeeper serves to agents. */
   customGatekeeper: { name: string; message: string };
+  /** Deployment-owned MCP Server Portal endpoint and policy. */
+  mcpPortal?: McpPortalConfig;
   /** Private explicit-issue destination. */
   errorReporting: { enabled: boolean; environment?: string; release?: string | null };
   /** Workshop KV/R2. `null` requests Wrangler automatic provisioning. */
@@ -184,6 +204,12 @@ export interface GeneratedConfigs {
   customGatekeeper: ProdWranglerConfig;
   /** Absent when `errorReporting.enabled` is false. */
   errorReporter?: ProdWranglerConfig;
+  /** Absent when `workers.google` is not configured. */
+  google?: ProdWranglerConfig;
+  /** Absent when `workers.mcpPortal` is not configured. */
+  mcpPortal?: ProdWranglerConfig;
+  /** Absent when `workers.homeassistant` is not configured. */
+  homeassistant?: ProdWranglerConfig;
 }
 
 /** The upstream base configs the generated ones are derived from. */
@@ -194,6 +220,9 @@ export interface BaseConfigs {
   scheduler: ProdWranglerConfig;
   customGatekeeper: ProdWranglerConfig;
   errorReporter: ProdWranglerConfig;
+  google: ProdWranglerConfig;
+  mcpPortal: ProdWranglerConfig;
+  homeassistant: ProdWranglerConfig;
 }
 
 /** One build step `deploy.ts` runs before deploying. See `buildCommands`. */

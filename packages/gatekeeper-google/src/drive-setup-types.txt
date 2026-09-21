@@ -49,6 +49,12 @@ export type DriveFolderInfo = {
  *     Always call listFiles()/listFilesAtPath() first to confirm the correct fileId.
  *   ✓ moveFileToPath() moves a file into a relative path under the bound folder.
  *     Intermediate folders are created if needed.
+ *   ✓ getDocContent() reads a Google Doc in the bound folder as Markdown (observation only).
+ *   ✓ appendDocContent() / prependDocContent() / replaceDocContent() edit a Google Doc
+ *     inside the bound folder subtree via the Docs API. All require user approval.
+ *     Only native Google Docs are accepted; non-doc fileIds are rejected.
+ *   ✓ copyFileToPath() copies a Google Doc into a relative path under the bound folder,
+ *     preserving all native formatting via the Drive files.copy API. Requires approval.
  *   ✗ Does NOT permanently delete files (use the Drive Trash UI for that).
  *   ✗ Does NOT send email (use the Gmail binding for that).
  *   ✗ Does NOT expose raw Drive folder IDs for creation/scaffolding; use relative names/paths.
@@ -341,4 +347,124 @@ export interface GoogleDriveFolderSession {
    *   await drive.moveFileToPath(file.id, []);
    */
   moveFileToPath(fileId: string, targetPath: string | string[]): Promise<void>;
+
+  /**
+   * Read the content of a native Google Doc within the bound folder as Markdown.
+   * No approval required — this is a read-only observation.
+   *
+   * SCOPE: Only Google Docs that are inside the bound folder's subtree are accessible.
+   * Files outside the bound folder or of a non-Doc MIME type are rejected.
+   *
+   * @param fileId  Drive file ID of a Google Doc, obtained from listFiles() or
+   *                listFilesAtPath(). Non-Doc files cause an immediate error.
+   *
+   * Supported Markdown features (same as GoogleDocSession.getContent):
+   *   Headings, bold, italic, bold-italic, links, strikethrough, bullet/numbered lists,
+   *   plain paragraphs. Unsupported elements (tables, images, code blocks) are plain text.
+   *
+   * Examples:
+   *   const docs = await drive.listFilesAtPath("Ana Silva", {
+   *     mimeType: "application/vnd.google-apps.document",
+   *   });
+   *   const content = await drive.getDocContent(docs[0].id);
+   */
+  getDocContent(fileId: string): Promise<string>;
+
+  /**
+   * Submit a request to append Markdown content to the end of a native Google Doc within
+   * the bound folder. Requires user approval before executing.
+   *
+   * SCOPE: Only native Google Docs inside the bound folder subtree are accepted.
+   *
+   * @param fileId    Drive file ID of a Google Doc within the bound folder.
+   * @param markdown  Markdown content to append (max 64 KB). Supports the same features
+   *                  as GoogleDocSession.appendText: headings, bold, italic, links,
+   *                  bullet/numbered lists, plain paragraphs.
+   *
+   * Examples:
+   *   // Append a weekly update section
+   *   await drive.appendDocContent(doc.id,
+   *     "## Semana 2026-09-21\n\nAtividades:\n- Atividade 1\n- Atividade 2\n",
+   *   );
+   */
+  appendDocContent(fileId: string, markdown: string): Promise<void>;
+
+  /**
+   * Submit a request to prepend Markdown content to the beginning of a native Google Doc
+   * within the bound folder. Requires user approval before executing.
+   *
+   * SCOPE: Only native Google Docs inside the bound folder subtree are accepted.
+   *
+   * @param fileId    Drive file ID of a Google Doc within the bound folder.
+   * @param markdown  Markdown content to prepend (max 64 KB). Same features as appendDocContent.
+   *
+   * Examples:
+   *   // Add a header section before existing content
+   *   await drive.prependDocContent(doc.id,
+   *     "# Aluno: Ana Silva\n\nTurma: A — Período: 2026-S2\n\n---\n\n",
+   *   );
+   */
+  prependDocContent(fileId: string, markdown: string): Promise<void>;
+
+  /**
+   * Submit a request to find and replace a unique passage in a native Google Doc within
+   * the bound folder. Requires user approval before executing.
+   *
+   * SCOPE: Only native Google Docs inside the bound folder subtree are accepted.
+   *
+   * `oldMarkdown` must appear exactly once in the document. If it appears zero or more
+   * than once, an error is thrown immediately so you can adjust the match context.
+   *
+   * @param fileId       Drive file ID of a Google Doc within the bound folder.
+   * @param oldMarkdown  Exact Markdown passage to locate (max 64 KB). Must be unique.
+   * @param newMarkdown  Replacement Markdown content (max 64 KB, may be empty to delete).
+   *
+   * Note: the match is validated against the live document at submit time and again at
+   * apply time. If the document changes between submit and apply the action may fail.
+   *
+   * Examples:
+   *   // Correct a name in a report
+   *   await drive.replaceDocContent(doc.id,
+   *     "Aluno: Ana Silve",   // typo in doc
+   *     "Aluno: Ana Silva",
+   *   );
+   */
+  replaceDocContent(fileId: string, oldMarkdown: string, newMarkdown: string): Promise<void>;
+
+  /**
+   * Submit a request to copy a native Google Doc within the bound folder to a target path,
+   * giving the copy a new name. Uses the Drive files.copy API, which preserves all native
+   * Google Docs formatting, tables, page breaks, styles, headers/footers, and embedded
+   * objects — unlike exporting and re-importing. Requires user approval before executing.
+   *
+   * SCOPE: Only native Google Docs inside the bound folder subtree are accepted as the source.
+   * The target path is always resolved under the bound folder; raw Drive IDs are never used.
+   *
+   * @param fileId      Drive file ID of the source Google Doc (within the bound folder).
+   * @param targetPath  Relative path under the bound folder for the copy. Same string | string[]
+   *                    convention as other path-aware methods. Pass [] or "" to place the copy
+   *                    in the bound folder itself.
+   * @param newName     Name for the copied file. Same character rules as folder names:
+   *                    non-empty, ≤ 255 chars, no `/`, `\`, or control characters.
+   *
+   * Intermediate folders in targetPath are created idempotently if absent.
+   * The action resolves/creates the target path at apply time (after approval).
+   *
+   * Examples:
+   *   // Copy a report template into each aluno's Relatorios folder
+   *   const templates = await drive.listFilesAtPath("Templates",
+   *     { mimeType: "application/vnd.google-apps.document" });
+   *   const template = templates.find(f => f.name === "Relatorio Mensal Template");
+   *   if (template) {
+   *     await drive.copyFileToPath(
+   *       template.id,
+   *       ["Ana Silva", "Relatorios Semanais"],
+   *       "Relatorio 2026-09",
+   *     );
+   *   }
+   *
+   *   // Copy into the bound folder itself
+   *   await drive.copyFileToPath(doc.id, [], "Copia de " + doc.name);
+   */
+  copyFileToPath(fileId: string, targetPath: string | string[], newName: string): Promise<void>;
 }

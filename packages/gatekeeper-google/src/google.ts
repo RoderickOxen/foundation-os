@@ -42,6 +42,7 @@ import CALENDAR_TYPES_CODE from "./calendar-types.txt";
 import SHEETS_TYPES_CODE from "./sheets-types.txt";
 import DRIVE_SETUP_TYPES_CODE from "./drive-setup-types.txt";
 import { DriveSetupApi } from "./drive-setup-api";
+import { isFileInSubtree } from "./drive-subtree";
 import {
   BigQueryConfiguratorUI,
   CalendarConfiguratorUI,
@@ -3904,6 +3905,32 @@ type GoogleDriveFolderAction =
       fileMimeType: string;
       targetPath: string[];
     }
+  /**
+   * appendDocContent / prependDocContent / replaceDocContent: Docs-API edits on a Google Doc
+   * that is within the bound folder subtree. fileName is fetched at submit time.
+   * markdown content is stored verbatim; apply calls the Docs batchUpdate API.
+   */
+  | { type: "appendDocContent";  fileId: string; fileName: string; markdown: string }
+  | { type: "prependDocContent"; fileId: string; fileName: string; markdown: string }
+  | {
+      type: "replaceDocContent";
+      fileId: string;
+      fileName: string;
+      oldMarkdown: string;
+      newMarkdown: string;
+    }
+  /**
+   * copyFileToPath: copy a Google Doc into a target path under the bound folder.
+   * fileName / fileMimeType fetched at submit time. targetPath resolved at apply time.
+   */
+  | {
+      type: "copyFileToPath";
+      fileId: string;
+      fileName: string;
+      fileMimeType: string;
+      newName: string;
+      targetPath: string[];
+    }
   // Legacy action type kept for backward-compatible applyAction on existing DOs.
   | { type: "setupWorkspace"; options: DriveWorkspaceSetupOptions };
 
@@ -3955,6 +3982,75 @@ function validateDriveFileId(fileId: string, context: string): void {
   if (/[\x00-\x1F\s]/.test(fileId)) {
     throw new Error(`${context}: fileId must not contain whitespace or control characters.`);
   }
+}
+
+/** MIME type for a native Google Doc — the only type permitted for doc-editing methods. */
+const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
+
+/** Maximum markdown payload for appendDocContent / prependDocContent / replaceDocContent. */
+const MAX_DOC_MARKDOWN_BYTES = 64 * 1024;
+
+/**
+ * Validate markdown content supplied to a doc-editing method.
+ * Enforces non-empty, and a 64 KB ceiling consistent with other text-based limits in the
+ * gatekeeper (e.g. MAX_GMAIL_BODY_BYTES).
+ */
+function validateDocMarkdown(markdown: string, context: string): void {
+  if (typeof markdown !== "string" || markdown.length === 0) {
+    throw new Error(`${context}: markdown must be a non-empty string.`);
+  }
+  if (new TextEncoder().encode(markdown).byteLength > MAX_DOC_MARKDOWN_BYTES) {
+    throw new Error(
+      `${context}: markdown content must not exceed ${MAX_DOC_MARKDOWN_BYTES / 1024} KB.`,
+    );
+  }
+}
+
+/**
+ * Verify that `fileId` refers to a native Google Doc **and** that the doc sits within the
+ * bound folder's subtree. Returns the file's Drive metadata (name, parents, mimeType)
+ * for use in approval descriptions.
+ *
+ * Throws with a clear message if either check fails.
+ *
+ * Subtree check: BFS ancestor traversal starting from the file's immediate parents.
+ * For a root-bound session (`boundFolderId === "root"`) any file whose ancestry reaches
+ * "root" (My Drive root) is accepted. Traversal depth is capped at 10 levels.
+ */
+async function assertDocInBoundFolder(
+  driveApi: DriveSetupApi,
+  fileId: string,
+  boundFolderId: string,
+) {
+  let meta = await driveApi.getFileMeta(fileId);
+
+  if (meta.mimeType !== GOOGLE_DOC_MIME_TYPE) {
+    throw new Error(
+      `File "${meta.name}" (${fileId}) is not a Google Doc ` +
+      `(mimeType: ${meta.mimeType}). Only native Google Docs can be edited with this method.`,
+    );
+  }
+
+  let inScope = await isFileInSubtree(
+    meta.parents ?? [],
+    boundFolderId,
+    async (folderId) => {
+      try {
+        return (await driveApi.getFileMeta(folderId)).parents ?? [];
+      } catch {
+        return [];
+      }
+    },
+  );
+
+  if (!inScope) {
+    throw new Error(
+      `File "${meta.name}" (${fileId}) is not inside the bound Drive folder subtree. ` +
+      "Only Google Docs within the connected folder can be edited through this binding.",
+    );
+  }
+
+  return meta;
 }
 
 /** For backward compat; kept as a type alias so legacy code in applyAction compiles. */
@@ -4147,6 +4243,68 @@ export class GoogleDriveSetupGatekeeperImpl
         );
         break;
       }
+      case "appendDocContent": {
+        // Fetch the current doc snapshot and append the stored markdown after the last
+        // body element. Uses the same insertAt = bodyEndIndex-1 pattern as
+        // GoogleDocSessionImpl.appendText.
+        let appendDocsApi = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+        let appendDoc = await appendDocsApi.getDocument(action.fileId);
+        let appendSnap = docToMarkdown(appendDoc);
+        let appendRequests = markdownToDocRequests("\n" + action.markdown, appendSnap.bodyEndIndex - 1);
+        if (appendRequests.length > 0) {
+          await appendDocsApi.batchUpdate(action.fileId, appendRequests, appendSnap.revisionId);
+        }
+        break;
+      }
+      case "prependDocContent": {
+        // Insert the stored markdown at index 1 (start of the document body), pushing
+        // existing content down. A trailing newline separates new from existing content.
+        let prependDocsApi = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+        let prependDoc = await prependDocsApi.getDocument(action.fileId);
+        let prependSnap = docToMarkdown(prependDoc);
+        let prependRequests = markdownToDocRequests(action.markdown + "\n", 1);
+        if (prependRequests.length > 0) {
+          await prependDocsApi.batchUpdate(action.fileId, prependRequests, prependSnap.revisionId);
+        }
+        break;
+      }
+      case "replaceDocContent": {
+        // Re-fetch the live document at apply time and recompute the replace operations
+        // against the current snapshot. Throws if oldMarkdown is no longer found or unique
+        // (document changed between submit and apply — action should be rejected).
+        let replaceDocsApi = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+        let replaceDoc = await replaceDocsApi.getDocument(action.fileId);
+        let replaceSnap = docToMarkdown(replaceDoc);
+        let replaceMatchStart = findUniqueMarkdown(
+          replaceSnap.markdown, action.oldMarkdown, "replaceDocContent(applyAction)",
+        );
+        let replaceResult = computeReplaceOperations(
+          replaceSnap.sourceMap,
+          replaceSnap.markdown,
+          replaceMatchStart,
+          replaceMatchStart + action.oldMarkdown.length,
+          action.newMarkdown,
+        );
+        if (replaceResult.requests.length > 0) {
+          await replaceDocsApi.batchUpdate(action.fileId, replaceResult.requests, replaceSnap.revisionId);
+        }
+        break;
+      }
+      case "copyFileToPath": {
+        // Resolve/create targetPath under the bound folder, then copy the source file there.
+        let copyTargetId: string = folderId;
+        for (let segment of action.targetPath) {
+          const parentId = copyTargetId === "root" ? undefined : copyTargetId;
+          let result = await api.findOrCreateFolder(segment, parentId);
+          copyTargetId = result.file.id;
+        }
+        await api.copyFile(
+          action.fileId,
+          action.newName,
+          copyTargetId === "root" ? undefined : copyTargetId,
+        );
+        break;
+      }
       case "setupWorkspace": {
         // Legacy action from before this gatekeeper became generic.
         // Kept for backward-compatible apply of pending "setupWorkspace" actions still queued
@@ -4257,6 +4415,33 @@ interface GoogleDriveFolderSession {
   trashFile(fileId: string): Promise<void>;
   /** Move a file into a folder resolved from a relative path under the bound folder. Requires approval. */
   moveFileToPath(fileId: string, targetPath: string | string[]): Promise<void>;
+  /**
+   * Read the content of a native Google Doc within the bound folder as Markdown (observation).
+   * Verifies the file is a Google Doc inside the bound folder subtree before reading.
+   */
+  getDocContent(fileId: string): Promise<string>;
+  /**
+   * Append Markdown content to the end of a Google Doc inside the bound folder (approval required).
+   * Verifies the file is a Google Doc inside the bound folder subtree before queuing.
+   */
+  appendDocContent(fileId: string, markdown: string): Promise<void>;
+  /**
+   * Prepend Markdown content to the start of a Google Doc inside the bound folder (approval required).
+   * Verifies the file is a Google Doc inside the bound folder subtree before queuing.
+   */
+  prependDocContent(fileId: string, markdown: string): Promise<void>;
+  /**
+   * Replace a unique passage in a Google Doc inside the bound folder (approval required).
+   * `oldMarkdown` must appear exactly once in the current document.
+   * Verifies the file is a Google Doc inside the bound folder subtree before queuing.
+   */
+  replaceDocContent(fileId: string, oldMarkdown: string, newMarkdown: string): Promise<void>;
+  /**
+   * Copy a Google Doc to a target path under the bound folder using the Drive files.copy API,
+   * which preserves all native formatting and layout (approval required).
+   * Verifies the source is a Google Doc inside the bound folder subtree before queuing.
+   */
+  copyFileToPath(fileId: string, targetPath: string | string[], newName: string): Promise<void>;
 }
 
 @validateRpc()
@@ -4709,6 +4894,226 @@ class GoogleDriveFolderSessionImpl extends RpcTarget implements GoogleDriveFolde
           `Move **${meta.name}** (${typeLabel}) into ${pathLabel}.\n\n` +
           formatApprovalField("File ID", fileId) +
           "\n\nThe file is removed from its current location and placed in the target folder." +
+          (pathSegments.length > 0
+            ? `\n\nIntermediate folder(s) (**${pathSegments.join(" → ")}**) will be created ` +
+              "if they do not already exist."
+            : ""),
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  // ── Google Doc editing / copy ─────────────────────────────────────────────
+  //
+  // All five methods below:
+  //   1. Validate the fileId format.
+  //   2. Call assertDocInBoundFolder — verifies MIME = Google Doc AND that the file sits
+  //      within the bound folder's ancestor chain (up to 10 levels deep).
+  //   3. Either record an observation (getDocContent) or submit an approval-gated action.
+  //
+  // applyAction cases for the write methods live in GoogleDriveSetupGatekeeperImpl and
+  // reuse the shared GoogleDocsApi / markdown-converter utilities already imported at the
+  // top of this file.
+
+  /**
+   * Read a native Google Doc within the bound folder and return its content as Markdown.
+   * This is a read-only observation — no approval required.
+   * Throws if the file is not a Google Doc or is outside the bound folder subtree.
+   */
+  async getDocContent(fileId: string): Promise<string> {
+    validateDriveFileId(fileId, "getDocContent");
+
+    let driveApi = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let meta = await assertDocInBoundFolder(driveApi, fileId, this.#folderId);
+
+    let docsApi = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let doc = await docsApi.getDocument(fileId);
+    let snapshot = docToMarkdown(doc);
+
+    await this.#approvalQueue.authorizeObservation({
+      title: sanitizeApprovalTitle(`Read Google Doc: ${meta.name}`),
+      description:
+        `Read the content of Google Doc **${meta.name}** as Markdown.\n\n` +
+        formatApprovalField("File ID", fileId),
+    });
+
+    return snapshot.markdown;
+  }
+
+  /**
+   * Submit a request to append Markdown content to the end of a native Google Doc within
+   * the bound folder. Requires user approval before executing.
+   * Throws if the file is not a Google Doc or is outside the bound folder subtree.
+   */
+  async appendDocContent(fileId: string, markdown: string): Promise<void> {
+    validateDriveFileId(fileId, "appendDocContent");
+    validateDocMarkdown(markdown, "appendDocContent");
+
+    let driveApi = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let meta = await assertDocInBoundFolder(driveApi, fileId, this.#folderId);
+
+    let preview = previewMarkdown(markdown, 150);
+    let action: GoogleDriveFolderAction = {
+      type: "appendDocContent",
+      fileId,
+      fileName: meta.name,
+      markdown,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Append to Doc: ${meta.name}`),
+        description:
+          `Append content to the end of Google Doc **${meta.name}**.\n\n` +
+          formatApprovalField("File ID", fileId) +
+          `\n\n${formatApprovalField("Content preview", preview)}`,
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Submit a request to prepend Markdown content to the start of a native Google Doc within
+   * the bound folder. Requires user approval before executing.
+   * Throws if the file is not a Google Doc or is outside the bound folder subtree.
+   */
+  async prependDocContent(fileId: string, markdown: string): Promise<void> {
+    validateDriveFileId(fileId, "prependDocContent");
+    validateDocMarkdown(markdown, "prependDocContent");
+
+    let driveApi = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let meta = await assertDocInBoundFolder(driveApi, fileId, this.#folderId);
+
+    let preview = previewMarkdown(markdown, 150);
+    let action: GoogleDriveFolderAction = {
+      type: "prependDocContent",
+      fileId,
+      fileName: meta.name,
+      markdown,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Prepend to Doc: ${meta.name}`),
+        description:
+          `Prepend content to the beginning of Google Doc **${meta.name}**.\n\n` +
+          formatApprovalField("File ID", fileId) +
+          `\n\n${formatApprovalField("Content preview", preview)}`,
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Submit a request to replace a unique passage in a native Google Doc within the bound
+   * folder. `oldMarkdown` must appear exactly once in the document at submit time.
+   * Requires user approval before executing.
+   * Throws if the file is not a Google Doc, is outside the bound folder subtree, or if
+   * `oldMarkdown` is not found or is ambiguous.
+   */
+  async replaceDocContent(fileId: string, oldMarkdown: string, newMarkdown: string): Promise<void> {
+    validateDriveFileId(fileId, "replaceDocContent");
+    validateDocMarkdown(oldMarkdown, "replaceDocContent: oldMarkdown");
+    // newMarkdown may be empty (deletion); still validate it's a string.
+    if (typeof newMarkdown !== "string") {
+      throw new Error("replaceDocContent: newMarkdown must be a string.");
+    }
+    if (new TextEncoder().encode(newMarkdown).byteLength > MAX_DOC_MARKDOWN_BYTES) {
+      throw new Error(
+        `replaceDocContent: newMarkdown must not exceed ${MAX_DOC_MARKDOWN_BYTES / 1024} KB.`,
+      );
+    }
+    if (oldMarkdown === newMarkdown) return;
+
+    let driveApi = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let meta = await assertDocInBoundFolder(driveApi, fileId, this.#folderId);
+
+    // Verify oldMarkdown is found and unique in the live document at submit time so
+    // the agent gets immediate feedback. At apply time the document is re-fetched.
+    let docsApi = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let doc = await docsApi.getDocument(fileId);
+    let snapshot = docToMarkdown(doc);
+    findUniqueMarkdown(snapshot.markdown, oldMarkdown, "replaceDocContent");
+
+    let oldPreview = previewMarkdown(oldMarkdown, 80);
+    let newPreview = previewMarkdown(newMarkdown, 80);
+    let action: GoogleDriveFolderAction = {
+      type: "replaceDocContent",
+      fileId,
+      fileName: meta.name,
+      oldMarkdown,
+      newMarkdown,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Edit Doc: ${meta.name}`),
+        description:
+          `Replace a passage in Google Doc **${meta.name}**.\n\n` +
+          formatApprovalField("File ID", fileId) +
+          `\n\n**Old passage:**\n\n${oldPreview}\n\n**New passage:**\n\n${newPreview}`,
+        implementsRevert: false,
+      });
+    } catch (error) {
+      this.#pendingActions.remove(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Submit a request to copy a native Google Doc within the bound folder to a target path,
+   * preserving all native formatting using the Drive files.copy API.
+   * Intermediate folders in `targetPath` are created idempotently if absent.
+   * Requires user approval before executing.
+   * Throws if the source file is not a Google Doc or is outside the bound folder subtree.
+   */
+  async copyFileToPath(
+    fileId: string,
+    targetPath: string | string[],
+    newName: string,
+  ): Promise<void> {
+    validateDriveFileId(fileId, "copyFileToPath");
+    let pathSegments = this.#resolvePathSegments(targetPath, "copyFileToPath");
+    validateDriveSegment(newName, "copyFileToPath: newName");
+
+    let driveApi = new DriveSetupApi(opts => this.#getAccessToken(opts));
+    let meta = await assertDocInBoundFolder(driveApi, fileId, this.#folderId);
+
+    let folderLabel = this.#folderId === "root" ? "My Drive" : `folder ${this.#folderId}`;
+    let pathLabel = pathSegments.length > 0
+      ? `**${pathSegments.join(" → ")}** (inside ${folderLabel})`
+      : folderLabel;
+
+    let action: GoogleDriveFolderAction = {
+      type: "copyFileToPath",
+      fileId,
+      fileName: meta.name,
+      fileMimeType: meta.mimeType,
+      newName,
+      targetPath: pathSegments,
+    };
+    let actionId = this.#pendingActions.submit(action);
+
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(`Copy Doc "${meta.name}" → "${newName}"`),
+        description:
+          `Copy Google Doc **${meta.name}** into ${pathLabel} as **${newName}**.\n\n` +
+          formatApprovalField("Source file ID", fileId) +
+          "\n\nAll native Google Doc formatting, tables, page breaks, and styles are " +
+          "preserved via the Drive files.copy API." +
           (pathSegments.length > 0
             ? `\n\nIntermediate folder(s) (**${pathSegments.join(" → ")}**) will be created ` +
               "if they do not already exist."

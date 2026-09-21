@@ -418,6 +418,40 @@ export class DriveSetupApi {
   // ── File lifecycle ────────────────────────────────────────────────────────
 
   /**
+   * Copy a Drive file, placing the copy in `parentId` with the given `name`.
+   * Uses the Drive v3 `files.copy` endpoint which preserves all native Google Workspace
+   * formatting, comments, and embedded objects.
+   *
+   * @param fileId    Source file ID to copy.
+   * @param name      Name for the copy.
+   * @param parentId  Parent folder for the copy (`undefined` → My Drive root).
+   * @returns The new file's ID and name.
+   */
+  async copyFile(
+    fileId: string,
+    name: string,
+    parentId?: string,
+  ): Promise<DriveFileRef> {
+    const meta: Record<string, unknown> = { name };
+    if (parentId) meta.parents = [parentId];
+
+    const response = await fetchWithAuthRetry(
+      `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}/copy`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(meta),
+      },
+      this.getToken,
+    );
+    if (!response.ok) {
+      const text = await readErrorText(response);
+      throw new Error(`Failed to copy Drive file [http=${response.status}]: ${text}`);
+    }
+    return response.json<DriveFileRef>();
+  }
+
+  /**
    * Soft-delete a file by setting `trashed = true` via a PATCH request.
    * The file is moved to Google Drive Trash and can be restored from there.
    * This is NOT a permanent deletion. Requires the `drive` scope.
